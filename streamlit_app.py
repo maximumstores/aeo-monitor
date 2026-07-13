@@ -21,6 +21,32 @@ if not DATABASE_URL:
     st.error("DATABASE_URL не найден в Secrets")
     st.stop()
 
+# ── Схема БД (IF NOT EXISTS — безопасно при каждом старте) ──
+DDL = """
+CREATE SCHEMA IF NOT EXISTS aeo;
+CREATE TABLE IF NOT EXISTS aeo.responses (
+    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
+    query_text text NOT NULL, response_text text,
+    fetched_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (week_start, query_id, provider));
+CREATE TABLE IF NOT EXISTS aeo.mentions (
+    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
+    brand text NOT NULL, is_ours boolean NOT NULL DEFAULT false,
+    mentioned boolean NOT NULL DEFAULT false, first_position int,
+    mention_count int NOT NULL DEFAULT 0,
+    PRIMARY KEY (week_start, query_id, provider, brand));
+CREATE TABLE IF NOT EXISTS aeo.citations (
+    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
+    url text NOT NULL, domain text NOT NULL, position int,
+    is_ours boolean NOT NULL DEFAULT false,
+    source_type text NOT NULL DEFAULT 'third_party', title text,
+    fetched_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (week_start, query_id, provider, url));
+"""
+with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
+    _cur.execute(DDL)
+    _c.commit()
+
 # ── Конфиг ниши (queries.yaml опционален) ──
 NICHE, N_QUERIES = "merino.tech", 16
 try:
