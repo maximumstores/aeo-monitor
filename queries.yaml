@@ -1,0 +1,39 @@
+# AEO Monitor — конфиг ниши. Правится руками, монитор подхватывает при запуске.
+
+our_domains:            # цитата с этих доменов = own_site / is_ours
+  - merino.tech
+
+brands:
+  ours:
+    - merino.tech
+  competitors:
+    - Smartwool
+    - Icebreaker
+    - Minus33
+    - MERIWOOL
+    - Woolx
+    - Ridge Merino
+    - Wool&Prince
+    - Ibex
+
+aliases:                # доп. написания бренда в тексте ответа (без регистра)
+  merino.tech: ["merino.tech", "merino tech", "merinotech"]
+  Wool&Prince: ["wool&prince", "wool & prince", "wool and prince"]
+
+queries:                # покупательские запросы ниши (id стабильные — по ним история)
+  - {id: q01, text: "What is the best merino wool base layer?"}
+  - {id: q02, text: "Best merino wool base layer for extreme cold weather"}
+  - {id: q03, text: "Best affordable merino wool base layer under $50"}
+  - {id: q04, text: "Smartwool vs Icebreaker vs cheaper merino brands — what to buy?"}
+  - {id: q05, text: "Best merino wool shirt for hiking and backpacking"}
+  - {id: q06, text: "Best merino base layer for skiing"}
+  - {id: q07, text: "Is 100% merino wool base layer worth it? Which brand?"}
+  - {id: q08, text: "Best merino wool leggings for winter"}
+  - {id: q09, text: "Best merino wool hoodie"}
+  - {id: q10, text: "What merino base layer do you recommend for running in cold weather?"}
+  - {id: q11, text: "Best budget alternative to Smartwool base layers"}
+  - {id: q12, text: "Best merino wool clothing brands on Amazon"}
+  - {id: q13, text: "250 gsm merino base layer recommendations"}
+  - {id: q14, text: "Best merino wool socks and base layers for hunting"}
+  - {id: q15, text: "Which merino base layer doesn't itch?"}
+  - {id: q16, text: "Best merino wool base layer for women"}
