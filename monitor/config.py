@@ -13,7 +13,7 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(os.getenv("AEO_CONFIG", ROOT / "queries.yaml"))
 
-DATABASE_URL = os.getenv("DATABASE_URL_TECH") or os.getenv("DATABASE_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
