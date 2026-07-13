@@ -8,7 +8,7 @@ import os
 import streamlit as st
 
 # ── Мост: Streamlit Secrets → env (до импорта monitor.config) ──
-for k in ("DATABASE_URL_TECH", "DATABASE_URL", "GEMINI_API_KEY", "OPENAI_API_KEY",
+for k in ("DATABASE_URL", "GEMINI_API_KEY", "OPENAI_API_KEY",
           "ANTHROPIC_API_KEY", "PERPLEXITY_API_KEY"):
     try:
         if k not in os.environ and k in st.secrets:
