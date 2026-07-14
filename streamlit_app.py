@@ -117,6 +117,15 @@ def our_query_matrix(week):
         WHERE m.week_start=%s AND m.is_ours
         ORDER BY m.query_id, m.provider""", (week,))
 
+def our_mentions_detail(week):
+    """Конкретные случаи упоминания нас: запрос + движок + сам ответ AI целиком."""
+    return _rows("""SELECT m.query_id, m.provider, m.first_position, m.mention_count,
+        r.query_text, r.response_text
+        FROM aeo.mentions m
+        JOIN aeo.responses r USING (week_start, query_id, provider)
+        WHERE m.week_start=%s AND m.is_ours AND m.mentioned
+        ORDER BY m.first_position, m.query_id""", (week,))
+
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 .stApp{background:#F4F6FA}
@@ -158,6 +167,7 @@ tr.ours td:last-child{border-radius:0 8px 8px 0}
 svg text{font-family:'IBM Plex Mono',monospace;font-size:9.5px;fill:#98A2B5}
 .legend{display:flex;gap:16px;font-size:12px;color:#5B6577;margin-top:8px;flex-wrap:wrap}
 .legend i{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px}
+.mtag{font-family:'IBM Plex Mono',monospace;font-size:11px;background:#E1F5EC;color:#12946A;padding:2px 8px;border-radius:999px;margin-right:8px}
 </style>""", unsafe_allow_html=True)
 
 P_SHORT = {"gemini":"GEM","openai":"GPT","perplexity":"PPLX","claude":"CLD","rufus":"RUF"}
@@ -267,6 +277,22 @@ with right:
     st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
 
 st.write("")
+
+# ── НОВОЕ: где мы реально упоминаемся — ссылки на живые ответы AI ──
+mentions_detail = our_mentions_detail(week)
+st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся ({len(mentions_detail)} случаев)</h2></div>',
+            unsafe_allow_html=True)
+if mentions_detail:
+    for m in mentions_detail:
+        label = (f'{P_SHORT.get(m["provider"], m["provider"].upper())} · позиция {m["first_position"]} · '
+                 f'{m["query_id"]} — {m["query_text"][:70]}')
+        with st.expander(label):
+            st.markdown(f'<span class="mtag">{m["mention_count"]}× упоминаний в ответе</span>', unsafe_allow_html=True)
+            st.write(m["response_text"])
+else:
+    st.info("На этой неделе ни один движок нас не упомянул ни разу.")
+
+st.write("")
 qm = our_query_matrix(week)
 if qm:
     grid = defaultdict(dict)
@@ -290,7 +316,7 @@ if qm:
         f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном движке: '
         f'кандидаты на /answers-страницу, тред или обзор</p></div>', unsafe_allow_html=True)
 
-with st.expander("Сырые ответы AI"):
+with st.expander("Сырые ответы AI (все, включая без упоминаний нас)"):
     resp = _rows("""SELECT query_id, provider, query_text, response_text
                     FROM aeo.responses WHERE week_start=%s ORDER BY query_id, provider""", (week,))
     qids = sorted({r["query_id"] for r in resp})
