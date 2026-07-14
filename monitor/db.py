@@ -65,3 +65,24 @@ def upsert_citations(conn, week, qid, provider, rows):
             ],
         )
     conn.commit()
+
+
+def get_week_texts(conn, week):
+    with conn.cursor() as cur:
+        cur.execute("SELECT response_text FROM aeo.responses WHERE week_start=%s", (week,))
+        return [r[0] for r in cur.fetchall() if r[0]]
+
+
+def upsert_brand_candidates(conn, week, candidates):
+    if not candidates:
+        return
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(
+            cur,
+            """INSERT INTO aeo.brand_candidates (week_start, brand, mention_count)
+               VALUES (%s,%s,%s)
+               ON CONFLICT (week_start, brand)
+               DO UPDATE SET mention_count = EXCLUDED.mention_count""",
+            [(week, c["brand"], c.get("count", 1)) for c in candidates],
+        )
+    conn.commit()
