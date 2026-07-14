@@ -118,13 +118,18 @@ def our_query_matrix(week):
         ORDER BY m.query_id, m.provider""", (week,))
 
 def our_mentions_detail(week):
-    """Конкретные случаи упоминания нас: запрос + движок + сам ответ AI целиком."""
     return _rows("""SELECT m.query_id, m.provider, m.first_position, m.mention_count,
         r.query_text, r.response_text
         FROM aeo.mentions m
         JOIN aeo.responses r USING (week_start, query_id, provider)
         WHERE m.week_start=%s AND m.is_ours AND m.mentioned
         ORDER BY m.first_position, m.query_id""", (week,))
+
+def citations_for(week, query_id, provider):
+    return _rows("""SELECT url, domain, source_type, is_ours
+        FROM aeo.citations
+        WHERE week_start=%s AND query_id=%s AND provider=%s
+        ORDER BY position""", (week, query_id, provider))
 
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -145,11 +150,12 @@ h2.sec{font-family:Manrope;font-weight:700;font-size:15px;color:#1A2233;margin:0
 .cbar{flex:1;height:9px;background:#EEF1F6;border-radius:5px;overflow:hidden;position:relative}
 .cbar i{position:absolute;left:0;top:0;bottom:0;border-radius:5px}
 .crow b{width:38px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#1A2233}
-.donor{display:flex;gap:8px;align-items:baseline;padding:5px 0;font-family:'IBM Plex Mono',monospace;font-size:11.5px;border-top:1px dashed #E4E8F0}
+.donor{display:flex;align-items:center;gap:8px;padding:6px 0;font-family:'IBM Plex Mono',monospace;font-size:11.5px;border-top:1px dashed #E4E8F0}
 .donor a{flex:1;color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
 .donor a:hover{text-decoration:underline;color:#3D5AFE}
 .donor.ours a{color:#12946A}
 .donor b{font-weight:600;color:#1A2233}
+.donor .stype{font-size:10px;color:#98A2B5;white-space:nowrap}
 table.aeo{width:100%;border-collapse:collapse;font-size:13px}
 table.aeo th{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#98A2B5;text-align:left;padding:6px 8px;border-bottom:1.5px solid #1A2233}
 table.aeo th.n,table.aeo td.n{text-align:right}
@@ -171,7 +177,7 @@ svg text{font-family:'IBM Plex Mono',monospace;font-size:9.5px;fill:#98A2B5}
 </style>""", unsafe_allow_html=True)
 
 P_SHORT = {"gemini":"GEM","openai":"GPT","perplexity":"PPLX","claude":"CLD","rufus":"RUF"}
-CH_LAB = {"own_site":"Наш сайт","social":"Reddit / соцсети","marketplace":"Маркетплейсы","third_party":"Чужие статьи"}
+CH_LAB = {"own_site":"свой сайт","social":"соцсети","marketplace":"маркетплейс","third_party":"чужая статья"}
 CH_COL = {"own_site":"#12946A","social":"#C07E14","marketplace":"#3D5AFE","third_party":"#98A2B5"}
 
 def delta(cur, prev):
@@ -278,17 +284,30 @@ with right:
 
 st.write("")
 
-# ── НОВОЕ: где мы реально упоминаемся — ссылки на живые ответы AI ──
 mentions_detail = our_mentions_detail(week)
-st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся ({len(mentions_detail)} случаев)</h2></div>',
-            unsafe_allow_html=True)
+st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся ({len(mentions_detail)} случаев)</h2>'
+            f'<p style="font-size:12.5px;color:#98A2B5;margin:0">Разворачиваешь запрос — видишь ссылки-источники, '
+            f'на которые опирался AI, отвечая о нас</p></div>', unsafe_allow_html=True)
 if mentions_detail:
     for m in mentions_detail:
         label = (f'{P_SHORT.get(m["provider"], m["provider"].upper())} · позиция {m["first_position"]} · '
                  f'{m["query_id"]} — {m["query_text"][:70]}')
         with st.expander(label):
-            st.markdown(f'<span class="mtag">{m["mention_count"]}× упоминаний в ответе</span>', unsafe_allow_html=True)
-            st.write(m["response_text"])
+            cits = citations_for(week, m["query_id"], m["provider"])
+            if cits:
+                links = "".join(
+                    f'<div class="donor {"ours" if c["is_ours"] else ""}">'
+                    f'<a href="{c["url"]}" target="_blank" rel="noopener">{c["domain"]}</a>'
+                    f'<span class="stype">{CH_LAB.get(c["source_type"], c["source_type"])}</span>'
+                    f'</div>' for c in cits)
+                st.markdown(f'<div class="lab">Источники этого ответа ({len(cits)})</div>{links}',
+                            unsafe_allow_html=True)
+            else:
+                st.caption("Источники не зафиксированы для этого запроса")
+            st.markdown(f'<div style="margin-top:10px"><span class="mtag">{m["mention_count"]}× упоминаний нас в тексте</span></div>',
+                        unsafe_allow_html=True)
+            with st.expander("Показать полный текст ответа AI"):
+                st.write(m["response_text"])
 else:
     st.info("На этой неделе ни один движок нас не упомянул ни разу.")
 
