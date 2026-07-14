@@ -61,7 +61,6 @@ except Exception:
     pass
 
 def highlight_brand(text, aliases):
-    """Подсвечивает упоминания нашего бренда прямо в тексте ответа AI."""
     if not text or not aliases:
         return text
     pattern = "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
@@ -83,68 +82,87 @@ def weeks():
     return [r["week_start"] for r in _rows(
         "SELECT DISTINCT week_start FROM aeo.mentions ORDER BY week_start")]
 
-def sov_by_brand(week):
-    return _rows("""SELECT brand, bool_or(is_ours) AS is_ours,
+def providers_in_week(week):
+    return [r["provider"] for r in _rows(
+        "SELECT DISTINCT provider FROM aeo.mentions WHERE week_start=%s ORDER BY provider", (week,))]
+
+def _prov_clause(provider):
+    return ("AND provider=%s", (provider,)) if provider else ("", ())
+
+def sov_by_brand(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT brand, bool_or(is_ours) AS is_ours,
         round(100.0*sum(mentioned::int)/count(*),1) AS sov,
         round(avg(first_position) FILTER (WHERE mentioned),1) AS avg_pos
-        FROM aeo.mentions WHERE week_start=%s GROUP BY brand ORDER BY sov DESC""", (week,))
+        FROM aeo.mentions WHERE week_start=%s {pc} GROUP BY brand ORDER BY sov DESC""", (week, *pp))
 
 def sov_by_brand_provider(week):
     return {(r["brand"], r["provider"]): float(r["sov"]) for r in _rows(
         """SELECT brand, provider, round(100.0*sum(mentioned::int)/count(*),0) AS sov
            FROM aeo.mentions WHERE week_start=%s GROUP BY brand, provider""", (week,))}
 
-def sov_trend():
-    return _rows("""SELECT week_start, brand,
+def sov_trend(provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT week_start, brand,
         round(100.0*sum(mentioned::int)/count(*),1) AS sov
-        FROM aeo.mentions GROUP BY week_start, brand ORDER BY week_start""")
+        FROM aeo.mentions WHERE true {pc} GROUP BY week_start, brand ORDER BY week_start""", pp)
 
-def channel_shares(week):
-    return _rows("""SELECT source_type, count(*) AS n,
+def channel_shares(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT source_type, count(*) AS n,
         round(100.0*count(*)/sum(count(*)) OVER (),0) AS pct
-        FROM aeo.citations WHERE week_start=%s GROUP BY source_type ORDER BY n DESC""", (week,))
+        FROM aeo.citations WHERE week_start=%s {pc} GROUP BY source_type ORDER BY n DESC""", (week, *pp))
 
-def own_citation_share(week):
-    r = _rows("""SELECT round(100.0*sum(is_ours::int)/greatest(count(*),1),1) AS pct
-                 FROM aeo.citations WHERE week_start=%s""", (week,))
+def own_citation_share(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    r = _rows(f"""SELECT round(100.0*sum(is_ours::int)/greatest(count(*),1),1) AS pct
+                 FROM aeo.citations WHERE week_start=%s {pc}""", (week, *pp))
     return float(r[0]["pct"]) if r and r[0]["pct"] is not None else 0.0
 
-def top_donors(week, limit=6):
-    return _rows("""SELECT domain, bool_or(is_ours) AS is_ours, count(*) AS n,
+def top_donors(week, provider=None, limit=6):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT domain, bool_or(is_ours) AS is_ours, count(*) AS n,
         (array_agg(url ORDER BY position))[1] AS sample_url
-        FROM aeo.citations WHERE week_start=%s GROUP BY domain
-        ORDER BY n DESC LIMIT %s""", (week, limit))
+        FROM aeo.citations WHERE week_start=%s {pc} GROUP BY domain
+        ORDER BY n DESC LIMIT %s""", (week, *pp, limit))
 
-def lost_own_urls(week, prev):
-    return _rows("""SELECT DISTINCT url FROM aeo.citations
-        WHERE week_start=%s AND is_ours AND url NOT IN
+def lost_own_urls(week, prev, provider=None):
+    pc, pp = _prov_clause(provider)
+    pc2 = pc.replace("provider", "cur.provider") if pc else ""
+    return _rows(f"""SELECT DISTINCT url FROM aeo.citations cur
+        WHERE week_start=%s AND is_ours {pc2} AND url NOT IN
           (SELECT url FROM aeo.citations WHERE week_start=%s AND is_ours) LIMIT 5""",
-        (prev, week))
+        (week, *pp, prev))
 
-def providers_in_week(week):
-    return [r["provider"] for r in _rows(
-        "SELECT DISTINCT provider FROM aeo.mentions WHERE week_start=%s ORDER BY provider", (week,))]
-
-def our_query_matrix(week):
-    return _rows("""SELECT m.query_id, r.query_text, m.provider, m.mentioned
+def our_query_matrix(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    pc2 = pc.replace("provider", "m.provider") if pc else ""
+    return _rows(f"""SELECT m.query_id, r.query_text, m.provider, m.mentioned
         FROM aeo.mentions m
         JOIN aeo.responses r USING (week_start, query_id, provider)
-        WHERE m.week_start=%s AND m.is_ours
-        ORDER BY m.query_id, m.provider""", (week,))
+        WHERE m.week_start=%s AND m.is_ours {pc2}
+        ORDER BY m.query_id, m.provider""", (week, *pp))
 
-def our_mentions_detail(week):
-    return _rows("""SELECT m.query_id, m.provider, m.first_position, m.mention_count,
+def our_mentions_detail(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    pc2 = pc.replace("provider", "m.provider") if pc else ""
+    return _rows(f"""SELECT m.query_id, m.provider, m.first_position, m.mention_count,
         r.query_text, r.response_text
         FROM aeo.mentions m
         JOIN aeo.responses r USING (week_start, query_id, provider)
-        WHERE m.week_start=%s AND m.is_ours AND m.mentioned
-        ORDER BY m.first_position, m.query_id""", (week,))
+        WHERE m.week_start=%s AND m.is_ours AND m.mentioned {pc2}
+        ORDER BY m.first_position, m.query_id""", (week, *pp))
 
 def citations_for(week, query_id, provider):
     return _rows("""SELECT url, domain, source_type, is_ours
         FROM aeo.citations
         WHERE week_start=%s AND query_id=%s AND provider=%s
         ORDER BY position""", (week, query_id, provider))
+
+def all_responses(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT query_id, provider, query_text, response_text
+                    FROM aeo.responses WHERE week_start=%s {pc} ORDER BY query_id, provider""", (week, *pp))
 
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -192,6 +210,7 @@ svg text{font-family:'IBM Plex Mono',monospace;font-size:9.5px;fill:#98A2B5}
 </style>""", unsafe_allow_html=True)
 
 P_SHORT = {"gemini":"GEM","openai":"GPT","perplexity":"PPLX","claude":"CLD","rufus":"RUF"}
+P_FULL = {"gemini":"Gemini","openai":"ChatGPT","claude":"Claude","perplexity":"Perplexity","rufus":"Rufus"}
 CH_LAB = {"own_site":"свой сайт","social":"соцсети","marketplace":"маркетплейс","third_party":"чужая статья"}
 CH_COL = {"own_site":"#12946A","social":"#C07E14","marketplace":"#3D5AFE","third_party":"#98A2B5"}
 
@@ -213,17 +232,27 @@ if not wks:
     st.stop()
 
 week, prev = wks[-1], (wks[-2] if len(wks) > 1 else None)
-brands = sov_by_brand(week)
-prev_sov = {r["brand"]: float(r["sov"]) for r in sov_by_brand(prev)} if prev else {}
+all_provs = providers_in_week(week)
+
+# ── Переключатель провайдера ──
+options = ["Все"] + [P_FULL.get(p, p.upper()) for p in all_provs]
+choice = st.radio("Провайдер", options, horizontal=True, label_visibility="collapsed")
+rev_map = {P_FULL.get(p, p.upper()): p for p in all_provs}
+provider = rev_map.get(choice)  # None если выбрано "Все"
+
+provs = [provider] if provider else all_provs
+
+brands = sov_by_brand(week, provider)
+prev_sov = {r["brand"]: float(r["sov"]) for r in sov_by_brand(prev, provider)} if prev else {}
 for b in brands:
     b["delta"] = delta(b["sov"], prev_sov.get(b["brand"]))
 per_prov = sov_by_brand_provider(week)
-provs = providers_in_week(week)
 ours = next((b for b in brands if b["is_ours"]), None)
-own_c, own_c_prev = own_citation_share(week), (own_citation_share(prev) if prev else None)
+own_c = own_citation_share(week, provider)
+own_c_prev = own_citation_share(prev, provider) if prev else None
 
 st.markdown(f'<div class="aeo-meta">{NICHE} · {week} · {N_QUERIES} queries · '
-            f'{" / ".join(provs).upper()} · weeks: {len(wks)}</div>', unsafe_allow_html=True)
+            f'{choice.upper()} · weeks: {len(wks)}</div>', unsafe_allow_html=True)
 st.write("")
 
 c1, c2, c3, c4 = st.columns(4)
@@ -236,7 +265,7 @@ st.write("")
 
 left, right = st.columns([1.7, 1])
 with left:
-    trend = sov_trend()
+    trend = sov_trend(provider)
     series = ([(ours["brand"], "#12946A", 2.6)] if ours else []) + \
         [(b, ["#C6CCDA","#8FB4F9"][i], 1.5)
          for i, b in enumerate([x["brand"] for x in brands if not x["is_ours"]][:2])]
@@ -249,7 +278,7 @@ with left:
     lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
     labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
     legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
-    st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice</h2>'
+    st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice — {choice}</h2>'
         f'<svg viewBox="0 0 600 165" width="100%">'
         f'<line x1="30" y1="130" x2="590" y2="130" stroke="#E4E8F0"/>'
         f'<line x1="30" y1="75" x2="590" y2="75" stroke="#EEF1F6"/>'
@@ -258,24 +287,24 @@ with left:
 with right:
     rows = "".join(f'<div class="crow"><span class="nm">{CH_LAB.get(c["source_type"],c["source_type"])}</span>'
         f'<div class="cbar"><i style="width:{c["pct"]}%;background:{CH_COL.get(c["source_type"],"#98A2B5")}"></i></div>'
-        f'<b>{c["pct"]}%</b></div>' for c in channel_shares(week))
+        f'<b>{c["pct"]}%</b></div>' for c in channel_shares(week, provider))
     donors = "".join(
         f'<div class="donor {"ours" if x["is_ours"] else ""}">'
         f'<a href="{x["sample_url"]}" target="_blank" rel="noopener">{x["domain"]}</a>'
         f'<b>{x["n"]}</b></div>'
-        for x in top_donors(week))
+        for x in top_donors(week, provider))
     st.markdown(f'<div class="card"><h2 class="sec">Откуда AI берёт информацию</h2>{rows}'
         f'<div class="lab" style="margin-top:14px">Топ-доноры цитат (клик — открыть статью)</div>{donors}</div>', unsafe_allow_html=True)
 st.write("")
 
 left, right = st.columns([1.4, 1])
 with left:
-    head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in provs)
+    head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in all_provs)
     body = ""
     for b in brands[:10]:
         dl = b["delta"]
         dcls = "up" if dl and dl>0 else "dn" if dl and dl<0 else ""
-        pcells = "".join(f'<td class="n">{int(per_prov[(b["brand"],p)]) if (b["brand"],p) in per_prov else "·"}</td>' for p in provs)
+        pcells = "".join(f'<td class="n">{int(per_prov[(b["brand"],p)]) if (b["brand"],p) in per_prov else "·"}</td>' for p in all_provs)
         site = BRAND_SITES.get(b["brand"], "")
         name_html = (f'<a href="{site}" target="_blank" rel="noopener">{b["brand"]}</a>'
                      if site else b["brand"])
@@ -283,11 +312,11 @@ with left:
                  f'<td class="n">{b["sov"]}%</td>'
                  f'<td class="n {dcls}">{f"{dl:+.0f}" if dl is not None else "—"}</td>'
                  f'<td class="n">{b["avg_pos"] or "—"}</td>{pcells}</tr>')
-    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI (клик — сайт бренда)</h2>'
+    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI — {choice} (клик — сайт бренда)</h2>'
         f'<table class="aeo"><tr><th>Бренд</th><th class="n">SOV</th><th class="n">Δ</th>'
         f'<th class="n">поз.</th>{head}</tr>{body}</table></div>', unsafe_allow_html=True)
 with right:
-    alerts = [{"sev":"HI","text":f'Выпала наша цитата: {r["url"]}'} for r in (lost_own_urls(week, prev) if prev else [])]
+    alerts = [{"sev":"HI","text":f'Выпала наша цитата: {r["url"]}'} for r in (lost_own_urls(week, prev, provider) if prev else [])]
     alerts += [{"sev":"MD","text":f'{b["brand"]} +{b["delta"]} п.п. за неделю'}
                for b in brands if not b["is_ours"] and b["delta"] and b["delta"] >= 5]
     dc = delta(own_c, own_c_prev)
@@ -299,8 +328,8 @@ with right:
 
 st.write("")
 
-mentions_detail = our_mentions_detail(week)
-st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся ({len(mentions_detail)} случаев)</h2>'
+mentions_detail = our_mentions_detail(week, provider)
+st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся — {choice} ({len(mentions_detail)} случаев)</h2>'
             f'<p style="font-size:12.5px;color:#98A2B5;margin:0">Открой запрос — увидишь источники и текст ответа '
             f'с подсветкой каждого упоминания {NICHE}</p></div>', unsafe_allow_html=True)
 if mentions_detail:
@@ -322,13 +351,12 @@ if mentions_detail:
             st.markdown(f'<div style="margin-top:10px"><span class="mtag">{m["mention_count"]}× упоминаний нас в тексте</span></div>',
                         unsafe_allow_html=True)
             st.markdown("**Текст ответа с подсветкой упоминаний:**")
-            highlighted = highlight_brand(m["response_text"], ALIASES)
-            st.markdown(highlighted, unsafe_allow_html=True)
+            st.markdown(highlight_brand(m["response_text"], ALIASES), unsafe_allow_html=True)
 else:
-    st.info("На этой неделе ни один движок нас не упомянул ни разу.")
+    st.info("В этом срезе ни один движок нас не упомянул ни разу.")
 
 st.write("")
-qm = our_query_matrix(week)
+qm = our_query_matrix(week, provider)
 if qm:
     grid = defaultdict(dict)
     qtexts = {}
@@ -346,14 +374,12 @@ if qm:
         row_style = ' style="background:#FBE9E4"' if total == 0 else ""
         body += (f'<tr{row_style}><td class="n">{qid}</td>'
                  f'<td>{qtexts[qid][:70]}</td>{cells}</tr>')
-    st.markdown(f'<div class="card"><h2 class="sec">Где нас нет — задачи на контент</h2>'
+    st.markdown(f'<div class="card"><h2 class="sec">Где нас нет — {choice}</h2>'
         f'<table class="aeo"><tr><th>ID</th><th>Запрос</th>{head}</tr>{body}</table>'
-        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном движке: '
-        f'кандидаты на /answers-страницу, тред или обзор</p></div>', unsafe_allow_html=True)
+        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном из выбранных движков</p></div>', unsafe_allow_html=True)
 
-with st.expander("Сырые ответы AI (все, включая без упоминаний нас)"):
-    resp = _rows("""SELECT query_id, provider, query_text, response_text
-                    FROM aeo.responses WHERE week_start=%s ORDER BY query_id, provider""", (week,))
+with st.expander("Сырые ответы AI"):
+    resp = all_responses(week, provider)
     qids = sorted({r["query_id"] for r in resp})
     if qids:
         sel = st.selectbox("Запрос", qids)
