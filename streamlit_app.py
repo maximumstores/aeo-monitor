@@ -75,6 +75,25 @@ def highlight_brand(text, aliases):
         text, flags=re.IGNORECASE,
     )
 
+def favicon(domain):
+    return f'https://www.google.com/s2/favicons?domain={domain}&sz=32'
+
+def source_row(domain, url, source_type, is_ours, title=None, mine=False):
+    """Единая карточка источника: favicon + домен-ссылка + заголовок + тип."""
+    t = (title or "")[:80]
+    subtitle = f'<div style="font-size:11px;color:{"#8A6D00" if mine else "#98A2B5"};font-weight:400;white-space:normal;line-height:1.3;margin-top:1px">{t}</div>' if t else ""
+    if mine:
+        return (f'<div class="donor" style="background:#FFF6D9;border-radius:6px;padding:7px 9px;margin:3px 0;'
+                f'border:1px solid #FFE58A;align-items:flex-start">'
+                f'<img src="{favicon(domain)}" width="16" height="16" style="margin-top:2px;border-radius:3px;flex-shrink:0">'
+                f'<a href="{url}" target="_blank" rel="noopener" style="color:#8A6D00;font-weight:700;display:block;flex:1">'
+                f'★ {domain} — это мы{subtitle}</a></div>')
+    return (f'<div class="donor" style="align-items:flex-start">'
+            f'<img src="{favicon(domain)}" width="16" height="16" style="margin-top:2px;border-radius:3px;flex-shrink:0">'
+            f'<a href="{url}" target="_blank" rel="noopener" style="display:block;flex:1">'
+            f'{domain}{subtitle}</a>'
+            f'<span class="stype">{CH_LAB.get(source_type, source_type)}</span></div>')
+
 @st.cache_data(ttl=600)
 def _rows(sql: str, params=()):
     with psycopg2.connect(DATABASE_URL) as conn, \
@@ -126,7 +145,8 @@ def own_citation_share(week, provider=None):
 def top_donors(week, provider=None, limit=6):
     pc, pp = _prov_clause(provider)
     return _rows(f"""SELECT domain, bool_or(is_ours) AS is_ours, count(*) AS n,
-        (array_agg(url ORDER BY position))[1] AS sample_url
+        (array_agg(url ORDER BY position))[1] AS sample_url,
+        (array_agg(title ORDER BY position))[1] AS sample_title
         FROM aeo.citations WHERE week_start=%s {pc} GROUP BY domain
         ORDER BY n DESC LIMIT %s""", (week, *pp, limit))
 
@@ -158,7 +178,7 @@ def our_mentions_detail(week, provider=None):
         ORDER BY m.first_position, m.query_id""", (week, *pp))
 
 def citations_for(week, query_id, provider):
-    return _rows("""SELECT url, domain, source_type, is_ours
+    return _rows("""SELECT url, domain, source_type, is_ours, title
         FROM aeo.citations
         WHERE week_start=%s AND query_id=%s AND provider=%s
         ORDER BY position""", (week, query_id, provider))
@@ -192,7 +212,7 @@ h2.sec{font-family:Manrope;font-weight:700;font-size:15px;color:#1A2233;margin:0
 .cbar i{position:absolute;left:0;top:0;bottom:0;border-radius:5px}
 .crow b{width:38px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#1A2233}
 .donor{display:flex;align-items:center;gap:8px;padding:6px 0;font-family:'IBM Plex Mono',monospace;font-size:11.5px;border-top:1px dashed #E4E8F0}
-.donor a{flex:1;color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
+.donor a{color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
 .donor a:hover{text-decoration:underline;color:#3D5AFE}
 .donor.ours a{color:#12946A}
 .donor b{font-weight:600;color:#1A2233}
@@ -294,9 +314,9 @@ with right:
         f'<div class="cbar"><i style="width:{c["pct"]}%;background:{CH_COL.get(c["source_type"],"#98A2B5")}"></i></div>'
         f'<b>{c["pct"]}%</b></div>' for c in channel_shares(week, provider))
     donors = "".join(
-        f'<div class="donor {"ours" if x["is_ours"] else ""}">'
-        f'<a href="{x["sample_url"]}" target="_blank" rel="noopener">{x["domain"]}</a>'
-        f'<b>{x["n"]}</b></div>'
+        source_row(x["domain"], x["sample_url"], "own_site" if x["is_ours"] else "third_party",
+                   x["is_ours"], x.get("sample_title"), mine=x["is_ours"]).replace(
+            '</div>', f'<b style="margin-left:6px">{x["n"]}</b></div>', 1)
         for x in top_donors(week, provider))
     st.markdown(f'<div class="card"><h2 class="sec">Откуда AI берёт информацию</h2>{rows}'
         f'<div class="lab" style="margin-top:14px">Топ-доноры цитат (клик — открыть статью)</div>{donors}</div>', unsafe_allow_html=True)
@@ -356,12 +376,8 @@ if mentions_detail:
             if cits:
                 cits_sorted = sorted(cits, key=lambda c: not c["is_ours"])
                 links = "".join(
-                    (f'<div class="donor" style="background:#FFF6D9;border-radius:6px;padding:6px 8px;margin:2px 0;border:1px solid #FFE58A">'
-                     f'<a href="{c["url"]}" target="_blank" rel="noopener" style="color:#8A6D00;font-weight:700">★ {c["domain"]} — это мы</a>'
-                     f'</div>'
-                     if c["is_ours"] else
-                     f'<div class="donor"><a href="{c["url"]}" target="_blank" rel="noopener">{c["domain"]}</a>'
-                     f'<span class="stype">{CH_LAB.get(c["source_type"], c["source_type"])}</span></div>')
+                    source_row(c["domain"], c["url"], c["source_type"], c["is_ours"],
+                               c.get("title"), mine=c["is_ours"])
                     for c in cits_sorted)
                 st.markdown(f'<div class="lab">Источники этого ответа ({len(cits)})</div>{links}',
                             unsafe_allow_html=True)
