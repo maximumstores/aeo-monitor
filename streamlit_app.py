@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """AEO Radar — дашборд, всё в одном файле. Секрет: DATABASE_URL."""
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import psycopg2
@@ -46,11 +47,13 @@ with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _c.commit()
 
 NICHE, N_QUERIES = "merino.tech", 16
+BRAND_SITES = {}
 try:
     import yaml
     _cfg = yaml.safe_load(Path("queries.yaml").read_text(encoding="utf-8"))
     NICHE = (_cfg.get("brands", {}).get("ours") or [NICHE])[0]
     N_QUERIES = len(_cfg.get("queries", [])) or N_QUERIES
+    BRAND_SITES = _cfg.get("brand_sites", {}) or {}
 except Exception:
     pass
 
@@ -107,6 +110,13 @@ def providers_in_week(week):
     return [r["provider"] for r in _rows(
         "SELECT DISTINCT provider FROM aeo.mentions WHERE week_start=%s ORDER BY provider", (week,))]
 
+def our_query_matrix(week):
+    return _rows("""SELECT m.query_id, r.query_text, m.provider, m.mentioned
+        FROM aeo.mentions m
+        JOIN aeo.responses r USING (week_start, query_id, provider)
+        WHERE m.week_start=%s AND m.is_ours
+        ORDER BY m.query_id, m.provider""", (week,))
+
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 .stApp{background:#F4F6FA}
@@ -136,6 +146,8 @@ table.aeo th{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing
 table.aeo th.n,table.aeo td.n{text-align:right}
 table.aeo td{padding:8px;border-bottom:1px solid #E4E8F0;color:#1A2233}
 table.aeo td.n{font-family:'IBM Plex Mono',monospace;font-size:12.5px}
+table.aeo td a{color:inherit;text-decoration:none}
+table.aeo td a:hover{text-decoration:underline;color:#3D5AFE}
 tr.ours td{background:#E1F5EC}
 tr.ours td:first-child{font-weight:600;color:#12946A;border-radius:8px 0 0 8px}
 tr.ours td:last-child{border-radius:0 8px 8px 0}
@@ -233,11 +245,14 @@ with left:
         dl = b["delta"]
         dcls = "up" if dl and dl>0 else "dn" if dl and dl<0 else ""
         pcells = "".join(f'<td class="n">{int(per_prov[(b["brand"],p)]) if (b["brand"],p) in per_prov else "·"}</td>' for p in provs)
-        body += (f'<tr class="{"ours" if b["is_ours"] else ""}"><td>{b["brand"]}</td>'
+        site = BRAND_SITES.get(b["brand"], "")
+        name_html = (f'<a href="{site}" target="_blank" rel="noopener">{b["brand"]}</a>'
+                     if site else b["brand"])
+        body += (f'<tr class="{"ours" if b["is_ours"] else ""}"><td>{name_html}</td>'
                  f'<td class="n">{b["sov"]}%</td>'
                  f'<td class="n {dcls}">{f"{dl:+.0f}" if dl is not None else "—"}</td>'
                  f'<td class="n">{b["avg_pos"] or "—"}</td>{pcells}</tr>')
-    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI</h2>'
+    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI (клик — сайт бренда)</h2>'
         f'<table class="aeo"><tr><th>Бренд</th><th class="n">SOV</th><th class="n">Δ</th>'
         f'<th class="n">поз.</th>{head}</tr>{body}</table></div>', unsafe_allow_html=True)
 with right:
@@ -250,6 +265,30 @@ with right:
     items = "".join(f'<div class="al"><span class="badge {"b-red" if a["sev"]=="HI" else "b-amb"}">{a["sev"]}</span><p>{a["text"]}</p></div>'
         for a in alerts[:6]) or '<p style="color:#98A2B5;font-size:13px">Пока тихо — нужна вторая неделя данных для дельт.</p>'
     st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
+
+st.write("")
+qm = our_query_matrix(week)
+if qm:
+    grid = defaultdict(dict)
+    qtexts = {}
+    for r in qm:
+        grid[r["query_id"]][r["provider"]] = r["mentioned"]
+        qtexts[r["query_id"]] = r["query_text"]
+    rows_sorted = sorted(grid.items(), key=lambda kv: sum(kv[1].values()))
+    head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in provs)
+    body = ""
+    for qid, per in rows_sorted:
+        total = sum(per.values())
+        cells = "".join(
+            f'<td class="n" style="color:{"#12946A" if per.get(p) else "#D6452C"}">{"✓" if per.get(p) else "✗"}</td>'
+            for p in provs)
+        row_style = ' style="background:#FBE9E4"' if total == 0 else ""
+        body += (f'<tr{row_style}><td class="n">{qid}</td>'
+                 f'<td>{qtexts[qid][:70]}</td>{cells}</tr>')
+    st.markdown(f'<div class="card"><h2 class="sec">Где нас нет — задачи на контент</h2>'
+        f'<table class="aeo"><tr><th>ID</th><th>Запрос</th>{head}</tr>{body}</table>'
+        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном движке: '
+        f'кандидаты на /answers-страницу, тред или обзор</p></div>', unsafe_allow_html=True)
 
 with st.expander("Сырые ответы AI"):
     resp = _rows("""SELECT query_id, provider, query_text, response_text
