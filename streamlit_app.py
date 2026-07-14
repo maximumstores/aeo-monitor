@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """AEO Radar — дашборд, всё в одном файле. Секрет: DATABASE_URL."""
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -48,14 +49,28 @@ with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
 
 NICHE, N_QUERIES = "merino.tech", 16
 BRAND_SITES = {}
+ALIASES = [NICHE]
 try:
     import yaml
     _cfg = yaml.safe_load(Path("queries.yaml").read_text(encoding="utf-8"))
     NICHE = (_cfg.get("brands", {}).get("ours") or [NICHE])[0]
     N_QUERIES = len(_cfg.get("queries", [])) or N_QUERIES
     BRAND_SITES = _cfg.get("brand_sites", {}) or {}
+    ALIASES = _cfg.get("aliases", {}).get(NICHE, [NICHE]) or [NICHE]
 except Exception:
     pass
+
+def highlight_brand(text, aliases):
+    """Подсвечивает упоминания нашего бренда прямо в тексте ответа AI."""
+    if not text or not aliases:
+        return text
+    pattern = "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
+    return re.sub(
+        f"({pattern})",
+        r'<mark style="background:#FFE58A;color:#1A2233;padding:1px 3px;'
+        r'border-radius:3px;font-weight:700">\1</mark>',
+        text, flags=re.IGNORECASE,
+    )
 
 @st.cache_data(ttl=600)
 def _rows(sql: str, params=()):
@@ -286,8 +301,8 @@ st.write("")
 
 mentions_detail = our_mentions_detail(week)
 st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся ({len(mentions_detail)} случаев)</h2>'
-            f'<p style="font-size:12.5px;color:#98A2B5;margin:0">Разворачиваешь запрос — видишь ссылки-источники, '
-            f'на которые опирался AI, отвечая о нас</p></div>', unsafe_allow_html=True)
+            f'<p style="font-size:12.5px;color:#98A2B5;margin:0">Открой запрос — увидишь источники и текст ответа '
+            f'с подсветкой каждого упоминания {NICHE}</p></div>', unsafe_allow_html=True)
 if mentions_detail:
     for m in mentions_detail:
         label = (f'{P_SHORT.get(m["provider"], m["provider"].upper())} · позиция {m["first_position"]} · '
@@ -306,8 +321,9 @@ if mentions_detail:
                 st.caption("Источники не зафиксированы для этого запроса")
             st.markdown(f'<div style="margin-top:10px"><span class="mtag">{m["mention_count"]}× упоминаний нас в тексте</span></div>',
                         unsafe_allow_html=True)
-            with st.expander("Показать полный текст ответа AI"):
-                st.write(m["response_text"])
+            st.markdown("**Текст ответа с подсветкой упоминаний:**")
+            highlighted = highlight_brand(m["response_text"], ALIASES)
+            st.markdown(highlighted, unsafe_allow_html=True)
 else:
     st.info("На этой неделе ни один движок нас не упомянул ни разу.")
 
@@ -344,5 +360,5 @@ with st.expander("Сырые ответы AI (все, включая без уп
         for r in resp:
             if r["query_id"] == sel:
                 st.markdown(f'**{r["provider"]}** — {r["query_text"][:90]}')
-                st.write(r["response_text"])
+                st.markdown(highlight_brand(r["response_text"], ALIASES), unsafe_allow_html=True)
                 st.divider()
