@@ -7,7 +7,6 @@ import psycopg2
 import psycopg2.extras
 import streamlit as st
 
-# ── Подключение ──
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
     try:
@@ -21,7 +20,6 @@ if not DATABASE_URL:
     st.error("DATABASE_URL не найден в Secrets")
     st.stop()
 
-# ── Схема БД (IF NOT EXISTS — безопасно при каждом старте) ──
 DDL = """
 CREATE SCHEMA IF NOT EXISTS aeo;
 CREATE TABLE IF NOT EXISTS aeo.responses (
@@ -47,7 +45,6 @@ with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
     _c.commit()
 
-# ── Конфиг ниши (queries.yaml опционален) ──
 NICHE, N_QUERIES = "merino.tech", 16
 try:
     import yaml
@@ -57,7 +54,6 @@ try:
 except Exception:
     pass
 
-# ── SQL ──
 @st.cache_data(ttl=600)
 def _rows(sql: str, params=()):
     with psycopg2.connect(DATABASE_URL) as conn, \
@@ -96,7 +92,8 @@ def own_citation_share(week):
     return float(r[0]["pct"]) if r and r[0]["pct"] is not None else 0.0
 
 def top_donors(week, limit=6):
-    return _rows("""SELECT domain, bool_or(is_ours) AS is_ours, count(*) AS n
+    return _rows("""SELECT domain, bool_or(is_ours) AS is_ours, count(*) AS n,
+        (array_agg(url ORDER BY position))[1] AS sample_url
         FROM aeo.citations WHERE week_start=%s GROUP BY domain
         ORDER BY n DESC LIMIT %s""", (week, limit))
 
@@ -110,7 +107,6 @@ def providers_in_week(week):
     return [r["provider"] for r in _rows(
         "SELECT DISTINCT provider FROM aeo.mentions WHERE week_start=%s ORDER BY provider", (week,))]
 
-# ── Стили ──
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 .stApp{background:#F4F6FA}
@@ -131,8 +127,10 @@ h2.sec{font-family:Manrope;font-weight:700;font-size:15px;color:#1A2233;margin:0
 .cbar i{position:absolute;left:0;top:0;bottom:0;border-radius:5px}
 .crow b{width:38px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#1A2233}
 .donor{display:flex;gap:8px;align-items:baseline;padding:5px 0;font-family:'IBM Plex Mono',monospace;font-size:11.5px;border-top:1px dashed #E4E8F0}
-.donor span{flex:1;color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.donor.ours span{color:#12946A}.donor b{font-weight:600;color:#1A2233}
+.donor a{flex:1;color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
+.donor a:hover{text-decoration:underline;color:#3D5AFE}
+.donor.ours a{color:#12946A}
+.donor b{font-weight:600;color:#1A2233}
 table.aeo{width:100%;border-collapse:collapse;font-size:13px}
 table.aeo th{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#98A2B5;text-align:left;padding:6px 8px;border-bottom:1.5px solid #1A2233}
 table.aeo th.n,table.aeo td.n{text-align:right}
@@ -165,7 +163,6 @@ def kpi(label, value, d=None):
     st.markdown(f'<div class="card"><div class="lab">{label}</div><div class="big">{value}</div>{dhtml(d)}</div>',
                 unsafe_allow_html=True)
 
-# ── Данные ──
 wks = weeks()
 st.markdown(f'<div class="aeo-logo">AEO<span>Radar</span></div>', unsafe_allow_html=True)
 if not wks:
@@ -219,10 +216,13 @@ with right:
     rows = "".join(f'<div class="crow"><span class="nm">{CH_LAB.get(c["source_type"],c["source_type"])}</span>'
         f'<div class="cbar"><i style="width:{c["pct"]}%;background:{CH_COL.get(c["source_type"],"#98A2B5")}"></i></div>'
         f'<b>{c["pct"]}%</b></div>' for c in channel_shares(week))
-    donors = "".join(f'<div class="donor {"ours" if x["is_ours"] else ""}"><span>{x["domain"]}</span><b>{x["n"]}</b></div>'
+    donors = "".join(
+        f'<div class="donor {"ours" if x["is_ours"] else ""}">'
+        f'<a href="{x["sample_url"]}" target="_blank" rel="noopener">{x["domain"]}</a>'
+        f'<b>{x["n"]}</b></div>'
         for x in top_donors(week))
     st.markdown(f'<div class="card"><h2 class="sec">Откуда AI берёт информацию</h2>{rows}'
-        f'<div class="lab" style="margin-top:14px">Топ-доноры цитат</div>{donors}</div>', unsafe_allow_html=True)
+        f'<div class="lab" style="margin-top:14px">Топ-доноры цитат (клик — открыть статью)</div>{donors}</div>', unsafe_allow_html=True)
 st.write("")
 
 left, right = st.columns([1.4, 1])
