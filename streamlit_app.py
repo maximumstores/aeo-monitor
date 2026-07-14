@@ -42,20 +42,24 @@ CREATE TABLE IF NOT EXISTS aeo.citations (
     source_type text NOT NULL DEFAULT 'third_party', title text,
     fetched_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (week_start, query_id, provider, url));
+CREATE TABLE IF NOT EXISTS aeo.brand_candidates (
+    week_start date NOT NULL,
+    brand text NOT NULL,
+    mention_count int NOT NULL DEFAULT 1,
+    status text NOT NULL DEFAULT 'new',
+    PRIMARY KEY (week_start, brand));
 """
 with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
     _c.commit()
 
 NICHE, N_QUERIES = "merino.tech", 16
-BRAND_SITES = {}
 ALIASES = [NICHE]
 try:
     import yaml
     _cfg = yaml.safe_load(Path("queries.yaml").read_text(encoding="utf-8"))
     NICHE = (_cfg.get("brands", {}).get("ours") or [NICHE])[0]
     N_QUERIES = len(_cfg.get("queries", [])) or N_QUERIES
-    BRAND_SITES = _cfg.get("brand_sites", {}) or {}
     ALIASES = _cfg.get("aliases", {}).get(NICHE, [NICHE]) or [NICHE]
 except Exception:
     pass
@@ -164,6 +168,10 @@ def all_responses(week, provider=None):
     return _rows(f"""SELECT query_id, provider, query_text, response_text
                     FROM aeo.responses WHERE week_start=%s {pc} ORDER BY query_id, provider""", (week, *pp))
 
+def brand_candidates(week):
+    return _rows("""SELECT brand, mention_count FROM aeo.brand_candidates
+        WHERE week_start=%s ORDER BY mention_count DESC""", (week,))
+
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 .stApp{background:#F4F6FA}
@@ -194,8 +202,6 @@ table.aeo th{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing
 table.aeo th.n,table.aeo td.n{text-align:right}
 table.aeo td{padding:8px;border-bottom:1px solid #E4E8F0;color:#1A2233}
 table.aeo td.n{font-family:'IBM Plex Mono',monospace;font-size:12.5px}
-table.aeo td a{color:inherit;text-decoration:none}
-table.aeo td a:hover{text-decoration:underline;color:#3D5AFE}
 tr.ours td{background:#E1F5EC}
 tr.ours td:first-child{font-weight:600;color:#12946A;border-radius:8px 0 0 8px}
 tr.ours td:last-child{border-radius:0 8px 8px 0}
@@ -234,11 +240,10 @@ if not wks:
 week, prev = wks[-1], (wks[-2] if len(wks) > 1 else None)
 all_provs = providers_in_week(week)
 
-# ── Переключатель провайдера ──
 options = ["Все"] + [P_FULL.get(p, p.upper()) for p in all_provs]
 choice = st.radio("Провайдер", options, horizontal=True, label_visibility="collapsed")
 rev_map = {P_FULL.get(p, p.upper()): p for p in all_provs}
-provider = rev_map.get(choice)  # None если выбрано "Все"
+provider = rev_map.get(choice)
 
 provs = [provider] if provider else all_provs
 
@@ -305,14 +310,11 @@ with left:
         dl = b["delta"]
         dcls = "up" if dl and dl>0 else "dn" if dl and dl<0 else ""
         pcells = "".join(f'<td class="n">{int(per_prov[(b["brand"],p)]) if (b["brand"],p) in per_prov else "·"}</td>' for p in all_provs)
-        site = BRAND_SITES.get(b["brand"], "")
-        name_html = (f'<a href="{site}" target="_blank" rel="noopener">{b["brand"]}</a>'
-                     if site else b["brand"])
-        body += (f'<tr class="{"ours" if b["is_ours"] else ""}"><td>{name_html}</td>'
+        body += (f'<tr class="{"ours" if b["is_ours"] else ""}"><td>{b["brand"]}</td>'
                  f'<td class="n">{b["sov"]}%</td>'
                  f'<td class="n {dcls}">{f"{dl:+.0f}" if dl is not None else "—"}</td>'
                  f'<td class="n">{b["avg_pos"] or "—"}</td>{pcells}</tr>')
-    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI — {choice} (клик — сайт бренда)</h2>'
+    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI — {choice}</h2>'
         f'<table class="aeo"><tr><th>Бренд</th><th class="n">SOV</th><th class="n">Δ</th>'
         f'<th class="n">поз.</th>{head}</tr>{body}</table></div>', unsafe_allow_html=True)
 with right:
@@ -327,6 +329,19 @@ with right:
     st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
 
 st.write("")
+cands = brand_candidates(week)
+if cands:
+    rows = "".join(
+        f'<div class="al"><span class="badge b-amb">NEW</span>'
+        f'<p><b>{c["brand"]}</b> — упомянут {c["mention_count"]}× в ответах этой недели, '
+        f'не в списке отслеживаемых брендов</p></div>'
+        for c in cands)
+    st.markdown(f'<div class="card"><h2 class="sec">AI заметил новые бренды ({len(cands)})</h2>{rows}'
+        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Если это реальный конкурент — добавь его '
+        f'в queries.yaml → competitors, и со следующей недели он появится в общей таблице</p></div>',
+        unsafe_allow_html=True)
+
+st.write("")
 
 mentions_detail = our_mentions_detail(week, provider)
 st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся — {choice} ({len(mentions_detail)} случаев)</h2>'
@@ -339,11 +354,15 @@ if mentions_detail:
         with st.expander(label):
             cits = citations_for(week, m["query_id"], m["provider"])
             if cits:
+                cits_sorted = sorted(cits, key=lambda c: not c["is_ours"])
                 links = "".join(
-                    f'<div class="donor {"ours" if c["is_ours"] else ""}">'
-                    f'<a href="{c["url"]}" target="_blank" rel="noopener">{c["domain"]}</a>'
-                    f'<span class="stype">{CH_LAB.get(c["source_type"], c["source_type"])}</span>'
-                    f'</div>' for c in cits)
+                    (f'<div class="donor" style="background:#FFF6D9;border-radius:6px;padding:6px 8px;margin:2px 0;border:1px solid #FFE58A">'
+                     f'<a href="{c["url"]}" target="_blank" rel="noopener" style="color:#8A6D00;font-weight:700">★ {c["domain"]} — это мы</a>'
+                     f'</div>'
+                     if c["is_ours"] else
+                     f'<div class="donor"><a href="{c["url"]}" target="_blank" rel="noopener">{c["domain"]}</a>'
+                     f'<span class="stype">{CH_LAB.get(c["source_type"], c["source_type"])}</span></div>')
+                    for c in cits_sorted)
                 st.markdown(f'<div class="lab">Источники этого ответа ({len(cits)})</div>{links}',
                             unsafe_allow_html=True)
             else:
