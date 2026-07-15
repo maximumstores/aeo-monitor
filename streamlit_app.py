@@ -22,6 +22,24 @@ if not DATABASE_URL:
     st.error("DATABASE_URL не найден в Secrets")
     st.stop()
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+if not ANTHROPIC_API_KEY:
+    try:
+        ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+VERTEX_SA_JSON_B64 = os.getenv("VERTEX_SA_JSON_B64", "")
+VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+for _k in ("GEMINI_API_KEY", "VERTEX_SA_JSON_B64", "VERTEX_PROJECT", "VERTEX_LOCATION"):
+    if not globals()[_k]:
+        try:
+            globals()[_k] = st.secrets[_k]
+        except Exception:
+            pass
+
 DDL = """
 CREATE SCHEMA IF NOT EXISTS aeo;
 CREATE TABLE IF NOT EXISTS aeo.responses (
@@ -48,6 +66,19 @@ CREATE TABLE IF NOT EXISTS aeo.brand_candidates (
     mention_count int NOT NULL DEFAULT 1,
     status text NOT NULL DEFAULT 'new',
     PRIMARY KEY (week_start, brand));
+CREATE TABLE IF NOT EXISTS aeo.experiments (
+    id serial PRIMARY KEY,
+    started_at date NOT NULL DEFAULT current_date,
+    description text NOT NULL,
+    query_id text,
+    url text,
+    created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS aeo.ai_insights (
+    week_start date NOT NULL,
+    provider text NOT NULL DEFAULT 'all',
+    content text NOT NULL,
+    generated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (week_start, provider));
 """
 with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
@@ -77,6 +108,7 @@ def highlight_brand(text, aliases):
 
 def favicon(domain):
     return f'https://www.google.com/s2/favicons?domain={domain}&sz=32'
+
 
 def source_row(domain, url, source_type, is_ours, title=None, mine=False):
     """Единая карточка источника: favicon + домен-ссылка + заголовок + тип."""
@@ -192,6 +224,142 @@ def brand_candidates(week):
     return _rows("""SELECT brand, mention_count FROM aeo.brand_candidates
         WHERE week_start=%s ORDER BY mention_count DESC""", (week,))
 
+def list_experiments():
+    return _rows("SELECT id, started_at, description, query_id, url FROM aeo.experiments ORDER BY started_at DESC")
+
+def log_experiment(started_at, description, query_id, url):
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO aeo.experiments (started_at, description, query_id, url) VALUES (%s,%s,%s,%s)",
+            (started_at, description, query_id or None, url or None))
+        conn.commit()
+    _rows.clear()
+
+
+def experiment_effect(started_at, query_id=None):
+    """Средний SOV (или own-site доля цитат, если query_id задан) ДО и ПОСЛЕ даты эксперимента."""
+    if query_id:
+        before = _rows("""SELECT round(100.0*sum(mentioned::int)/greatest(count(*),1),1) AS v
+            FROM aeo.mentions WHERE is_ours AND query_id=%s AND week_start < %s""", (query_id, started_at))
+        after = _rows("""SELECT round(100.0*sum(mentioned::int)/greatest(count(*),1),1) AS v
+            FROM aeo.mentions WHERE is_ours AND query_id=%s AND week_start >= %s""", (query_id, started_at))
+    else:
+        before = _rows("""SELECT round(100.0*sum(mentioned::int)/greatest(count(*),1),1) AS v
+            FROM aeo.mentions WHERE is_ours AND week_start < %s""", (started_at,))
+        after = _rows("""SELECT round(100.0*sum(mentioned::int)/greatest(count(*),1),1) AS v
+            FROM aeo.mentions WHERE is_ours AND week_start >= %s""", (started_at,))
+    b = before[0]["v"] if before and before[0]["v"] is not None else None
+    a = after[0]["v"] if after and after[0]["v"] is not None else None
+    return b, a
+
+def get_cached_insight(week, provider_key):
+    r = _rows("SELECT content, generated_at FROM aeo.ai_insights WHERE week_start=%s AND provider=%s",
+               (week, provider_key))
+    return r[0] if r else None
+
+def save_insight(week, provider_key, content):
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO aeo.ai_insights (week_start, provider, content, generated_at)
+               VALUES (%s,%s,%s,now())
+               ON CONFLICT (week_start, provider)
+               DO UPDATE SET content=EXCLUDED.content, generated_at=now()""",
+            (week, provider_key, content))
+        conn.commit()
+    _rows.clear()
+
+def build_ai_context(week, provider, brands, own_c, channels, donors, qmatrix, niche):
+    lines = [f"Ниша: {niche}. Неделя: {week}. Провайдер(ы): {provider or 'все'}.", ""]
+    lines.append("SOV по брендам (кто и на сколько нас обходит):")
+    for b in brands[:8]:
+        mark = " <- ЭТО МЫ" if b["is_ours"] else ""
+        lines.append(f"- {b['brand']}: SOV {b['sov']}%, средняя позиция {b['avg_pos']}{mark}")
+    lines.append("")
+    lines.append(f"Доля цитат с нашего сайта: {own_c}%")
+    lines.append("Разбивка источников по типу:")
+    for c in channels:
+        lines.append(f"- {CH_LAB.get(c['source_type'], c['source_type'])}: {c['pct']}%")
+    lines.append("")
+    lines.append("Топ-доноры цитат в нише (чьи сайты AI цитирует чаще всего):")
+    for d in donors:
+        mine = " (это наш сайт)" if d["is_ours"] else ""
+        lines.append(f"- {d['domain']}: {d['n']} цитат{mine}")
+    lines.append("")
+    if qmatrix:
+        grid = defaultdict(dict)
+        qtexts = {}
+        for r in qmatrix:
+            grid[r["query_id"]][r["provider"]] = r["mentioned"]
+            qtexts[r["query_id"]] = r["query_text"]
+        zero = [qid for qid, per in grid.items() if not any(per.values())]
+        lines.append(f"Запросы, где нас НЕ упоминает ни один движок ({len(zero)} из {len(grid)}):")
+        for qid in zero[:10]:
+            lines.append(f"- {qid}: {qtexts[qid]}")
+    return "\n".join(lines)
+
+def _build_report_prompt(context_text):
+    return f"""Ты — консультант по GEO/AEO-стратегии (видимость бренда в ответах AI-агентов).
+Ниже данные недельного мониторинга бренда в ответах Gemini/Claude/ChatGPT по покупательским запросам ниши.
+
+{context_text}
+
+Дай разбор в стиле консалтингового отчёта (McKinsey-style), строго по структуре, на русском:
+
+**Ситуация** — 2-3 предложения: что происходит объективно, без оценок.
+
+**Вывод** — 2-3 предложения: что это значит для бизнеса, почему это важно, к чему ведёт при сохранении статус-кво.
+
+**Что делать** — пронумерованный список из 3-5 КОНКРЕТНЫХ действий, каждое с указанием: что именно сделать, на каком домене/запросе, и ожидаемый эффект. Приоритет — от самого дешёвого/быстрого к более затратному. Никаких общих фраз вроде "улучшить контент" — только конкретика с именами доменов и id запросов из данных выше.
+
+Пиши по делу, без вступлений и извинений, сразу с "**Ситуация**"."""
+
+
+
+
+def ai_analyze(context_text):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": _build_report_prompt(context_text)}],
+    )
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+def ai_analyze_gemini(context_text):
+    import base64
+    import json
+
+    from google import genai
+    from google.genai import types
+
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        from google.oauth2 import service_account
+
+        info = json.loads(base64.b64decode(VERTEX_SA_JSON_B64))
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        project = VERTEX_PROJECT or info.get("project_id")
+        client = genai.Client(vertexai=True, project=project, location=VERTEX_LOCATION, credentials=creds)
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=_build_report_prompt(context_text),
+        config=types.GenerateContentConfig(),
+    )
+    return resp.text or ""
+
+
+AI_MODELS = {}
+if ANTHROPIC_API_KEY:
+    AI_MODELS["Claude"] = ("claude", ai_analyze)
+if GEMINI_API_KEY or VERTEX_SA_JSON_B64:
+    AI_MODELS["Gemini"] = ("gemini", ai_analyze_gemini)
+
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 .stApp{background:#F4F6FA}
@@ -212,7 +380,7 @@ h2.sec{font-family:Manrope;font-weight:700;font-size:15px;color:#1A2233;margin:0
 .cbar i{position:absolute;left:0;top:0;bottom:0;border-radius:5px}
 .crow b{width:38px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#1A2233}
 .donor{display:flex;align-items:center;gap:8px;padding:6px 0;font-family:'IBM Plex Mono',monospace;font-size:11.5px;border-top:1px dashed #E4E8F0}
-.donor a{color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
+.donor a{flex:1;color:#5B6577;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
 .donor a:hover{text-decoration:underline;color:#3D5AFE}
 .donor.ours a{color:#12946A}
 .donor b{font-weight:600;color:#1A2233}
@@ -303,7 +471,6 @@ with left:
     lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
     labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
     legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
-
     leader = brands[0] if brands else None
     insights = []
     if leader and ours and leader["brand"] != ours["brand"]:
@@ -360,6 +527,68 @@ with right:
     items = "".join(f'<div class="al"><span class="badge {"b-red" if a["sev"]=="HI" else "b-amb"}">{a["sev"]}</span><p>{a["text"]}</p></div>'
         for a in alerts[:6]) or '<p style="color:#98A2B5;font-size:13px">Пока тихо — нужна вторая неделя данных для дельт.</p>'
     st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
+
+st.write("")
+if not AI_MODELS:
+    st.caption("Добавь ANTHROPIC_API_KEY или GEMINI_API_KEY/VERTEX_SA_JSON_B64 в Secrets, чтобы включить AI-разбор")
+else:
+    model_col, btn_col = st.columns([3, 2])
+    with model_col:
+        model_choice = st.radio("Аналитик", list(AI_MODELS.keys()), horizontal=True, label_visibility="collapsed")
+    model_suffix, analyze_fn = AI_MODELS[model_choice]
+    cache_key = f"{provider or 'all'}::{model_suffix}"
+    cached = get_cached_insight(week, cache_key)
+    with btn_col:
+        gen_clicked = st.button(
+            f"🤖 {'Обновить' if cached else 'Сгенерировать'} разбор от {model_choice}",
+            use_container_width=True)
+    if gen_clicked:
+        with st.spinner(f"{model_choice} анализирует данные недели..."):
+            ctx = build_ai_context(week, provider, brands, own_c, channel_shares(week, provider),
+                                    top_donors(week, provider, limit=8), our_query_matrix(week, provider), NICHE)
+            try:
+                content = analyze_fn(ctx)
+                save_insight(week, cache_key, content)
+                cached = {"content": content, "generated_at": None}
+            except Exception as e:
+                st.error(f"Ошибка генерации: {e}")
+                cached = None
+    if cached:
+        st.markdown(f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>{cached["content"]}</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.caption(f"Разбор от {model_choice} ещё не сгенерирован для этого среза — нажми кнопку выше")
+
+st.write("")
+with st.expander("⚗ Эксперименты — записать правку и увидеть эффект"):
+    with st.form("new_experiment", clear_on_submit=True):
+        exp_desc = st.text_input("Что сделали (например: добавили /answers на q07)")
+        exp_qid = st.text_input("query_id (необязательно, если правка про конкретный запрос)")
+        exp_url = st.text_input("URL правки (необязательно)")
+        exp_date = st.date_input("Дата правки")
+        submitted = st.form_submit_button("Записать эксперимент")
+        if submitted and exp_desc:
+            log_experiment(exp_date, exp_desc, exp_qid.strip() or None, exp_url.strip() or None)
+            st.success("Записано — дельта появится ниже по мере накопления данных до/после этой даты")
+
+    exps = list_experiments()
+    if exps:
+        rows_html = ""
+        for e in exps:
+            b, a = experiment_effect(e["started_at"], e["query_id"])
+            if b is None or a is None:
+                verdict = '<span style="color:#98A2B5">недостаточно данных до/после</span>'
+            else:
+                d = round(a - b, 1)
+                cls = "up" if d >= 0 else "dn"
+                verdict = f'{b}% → {a}% <span class="delta {cls}" style="margin-left:6px">{d:+.1f} pp</span>'
+            scope = f'запрос {e["query_id"]}' if e["query_id"] else "вся ниша"
+            link = f' · <a href="{e["url"]}" target="_blank" rel="noopener">ссылка</a>' if e["url"] else ""
+            rows_html += (f'<div class="al"><span class="badge b-amb">{e["started_at"]}</span>'
+                          f'<p><b>{e["description"]}</b> ({scope}){link}<br>{verdict}</p></div>')
+        st.markdown(rows_html, unsafe_allow_html=True)
+    else:
+        st.caption("Пока нет ни одного зафиксированного эксперимента")
 
 st.write("")
 cands = brand_candidates(week)
