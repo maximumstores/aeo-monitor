@@ -670,4 +670,4 @@ with st.expander("Сырые ответы AI"):
             if r["query_id"] == sel:
                 st.markdown(f'**{r["provider"]}** — {r["query_text"][:90]}')
                 st.markdown(highlight_brand(r["response_text"], ALIASES), unsafe_allow_html=True)
-                st.divider()
+                st.divider() 
