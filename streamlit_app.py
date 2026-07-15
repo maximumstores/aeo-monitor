@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """AEO Radar — дашборд, всё в одном файле. Секрет: DATABASE_URL."""
+import hashlib
 import os
 import re
 from collections import defaultdict
@@ -73,12 +74,16 @@ CREATE TABLE IF NOT EXISTS aeo.experiments (
     query_id text,
     url text,
     created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS problem text;
+ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS hypothesis text;
+ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS baseline_sov numeric;
 CREATE TABLE IF NOT EXISTS aeo.ai_insights (
     week_start date NOT NULL,
     provider text NOT NULL DEFAULT 'all',
     content text NOT NULL,
     generated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (week_start, provider));
+ALTER TABLE aeo.ai_insights ADD COLUMN IF NOT EXISTS data_hash text;
 """
 with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
@@ -227,17 +232,40 @@ def brand_candidates(week):
 def list_experiments():
     return _rows("SELECT id, started_at, description, query_id, url FROM aeo.experiments ORDER BY started_at DESC")
 
-def log_experiment(started_at, description, query_id, url):
+def log_experiment(started_at, problem, hypothesis, action, query_id, url, baseline_sov):
     with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO aeo.experiments (started_at, description, query_id, url) VALUES (%s,%s,%s,%s)",
-            (started_at, description, query_id or None, url or None))
+            """INSERT INTO aeo.experiments
+               (started_at, description, problem, hypothesis, query_id, url, baseline_sov)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (started_at, action, problem or None, hypothesis or None,
+             query_id or None, url or None, baseline_sov))
         conn.commit()
     _rows.clear()
 
 
+def list_experiments():
+    return _rows("""SELECT id, started_at, description, problem, hypothesis, query_id, url, baseline_sov
+                     FROM aeo.experiments ORDER BY started_at DESC""")
+
+
+def experiment_effect_at(started_at, query_id, weeks_after):
+    """SOV (доля упоминаний нас) в конкретной неделе через N недель после старта эксперимента,
+    и последний известный SOV до старта (baseline, если явно не передан)."""
+    from datetime import timedelta
+    target = started_at + timedelta(weeks=weeks_after)
+    qc = "AND query_id=%s" if query_id else ""
+    params = (query_id, target) if query_id else (target,)
+    r = _rows(f"""SELECT week_start, round(100.0*sum(mentioned::int)/greatest(count(*),1),1) AS v
+        FROM aeo.mentions WHERE is_ours {qc} AND week_start <= %s
+        GROUP BY week_start ORDER BY week_start DESC LIMIT 1""", (*params[:-1], params[-1]) if query_id else (params[-1],))
+    if not r or r[0]["v"] is None:
+        return None, None
+    return r[0]["week_start"], float(r[0]["v"])
+
+
 def experiment_effect(started_at, query_id=None):
-    """Средний SOV (или own-site доля цитат, если query_id задан) ДО и ПОСЛЕ даты эксперимента."""
+    """Совместимость: средний SOV ДО и ПОСЛЕ даты эксперимента (для простого случая)."""
     if query_id:
         before = _rows("""SELECT round(100.0*sum(mentioned::int)/greatest(count(*),1),1) AS v
             FROM aeo.mentions WHERE is_ours AND query_id=%s AND week_start < %s""", (query_id, started_at))
@@ -253,38 +281,35 @@ def experiment_effect(started_at, query_id=None):
     return b, a
 
 def get_cached_insight(week, provider_key):
-    r = _rows("SELECT content, generated_at FROM aeo.ai_insights WHERE week_start=%s AND provider=%s",
+    r = _rows("SELECT content, generated_at, data_hash FROM aeo.ai_insights WHERE week_start=%s AND provider=%s",
                (week, provider_key))
     return r[0] if r else None
 
-def save_insight(week, provider_key, content):
+def save_insight(week, provider_key, content, data_hash):
     with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO aeo.ai_insights (week_start, provider, content, generated_at)
-               VALUES (%s,%s,%s,now())
+            """INSERT INTO aeo.ai_insights (week_start, provider, content, generated_at, data_hash)
+               VALUES (%s,%s,%s,now(),%s)
                ON CONFLICT (week_start, provider)
-               DO UPDATE SET content=EXCLUDED.content, generated_at=now()""",
-            (week, provider_key, content))
+               DO UPDATE SET content=EXCLUDED.content, generated_at=now(), data_hash=EXCLUDED.data_hash""",
+            (week, provider_key, content, data_hash))
         conn.commit()
     _rows.clear()
 
 def build_ai_context(week, provider, brands, own_c, channels, donors, qmatrix, niche):
-    lines = [f"Ниша: {niche}. Неделя: {week}. Провайдер(ы): {provider or 'все'}.", ""]
-    lines.append("SOV по брендам (кто и на сколько нас обходит):")
-    for b in brands[:8]:
-        mark = " <- ЭТО МЫ" if b["is_ours"] else ""
-        lines.append(f"- {b['brand']}: SOV {b['sov']}%, средняя позиция {b['avg_pos']}{mark}")
-    lines.append("")
-    lines.append(f"Доля цитат с нашего сайта: {own_c}%")
-    lines.append("Разбивка источников по типу:")
-    for c in channels:
-        lines.append(f"- {CH_LAB.get(c['source_type'], c['source_type'])}: {c['pct']}%")
-    lines.append("")
-    lines.append("Топ-доноры цитат в нише (чьи сайты AI цитирует чаще всего):")
-    for d in donors:
-        mine = " (это наш сайт)" if d["is_ours"] else ""
-        lines.append(f"- {d['domain']}: {d['n']} цитат{mine}")
-    lines.append("")
+    """Строгий JSON-снапшот — Claude/Gemini обязаны использовать эти числа дословно, не пересчитывать."""
+    import json as _json
+
+    payload = {
+        "niche": niche, "week": str(week), "provider_filter": provider or "все",
+        "brands": [
+            {"brand": b["brand"], "is_ours": b["is_ours"], "sov_pct": b["sov"], "avg_position": b["avg_pos"]}
+            for b in brands[:8]
+        ],
+        "own_site_citation_share_pct": own_c,
+        "channel_shares_pct": {c["source_type"]: c["pct"] for c in channels},
+        "top_donors": [{"domain": d["domain"], "citations": d["n"], "is_ours": d["is_ours"]} for d in donors],
+    }
     if qmatrix:
         grid = defaultdict(dict)
         qtexts = {}
@@ -292,24 +317,36 @@ def build_ai_context(week, provider, brands, own_c, channels, donors, qmatrix, n
             grid[r["query_id"]][r["provider"]] = r["mentioned"]
             qtexts[r["query_id"]] = r["query_text"]
         zero = [qid for qid, per in grid.items() if not any(per.values())]
-        lines.append(f"Запросы, где нас НЕ упоминает ни один движок ({len(zero)} из {len(grid)}):")
-        for qid in zero[:10]:
-            lines.append(f"- {qid}: {qtexts[qid]}")
-    return "\n".join(lines)
+        payload["queries_with_zero_mentions"] = [
+            {"query_id": qid, "query_text": qtexts[qid]} for qid in zero[:10]
+        ]
+        payload["queries_with_zero_mentions_count"] = len(zero)
+        payload["queries_total_count"] = len(grid)
+    return _json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def context_hash(context_text):
+    return hashlib.sha256(context_text.encode("utf-8")).hexdigest()[:12]
 
 def _build_report_prompt(context_text):
     return f"""Ты — консультант по GEO/AEO-стратегии (видимость бренда в ответах AI-агентов).
-Ниже данные недельного мониторинга бренда в ответах Gemini/Claude/ChatGPT по покупательским запросам ниши.
+Ниже JSON-снапшот недельного мониторинга бренда в ответах Gemini/Claude/ChatGPT/Google по покупательским запросам ниши.
 
 {context_text}
 
+СТРОГИЕ ПРАВИЛА ТОЧНОСТИ (обязательны, нарушение недопустимо):
+1. Используй ТОЛЬКО числа, буквально присутствующие в JSON выше. Никогда не пересчитывай, не округляй иначе и не придумывай проценты, доли, счётчики цитат — копируй их из JSON дословно (те же значения и то же число знаков после запятой).
+2. НЕ придумывай прогнозные числа: никаких "+X п.п. за Y недель", никаких сумм в долларах, никаких таймлайнов вида "4-6 недель". У нас пока нет исторических данных, чтобы такие оценки были правдой, а не выдумкой — их отсутствие в JSON означает, что их не существует.
+3. Вместо числовых прогнозов используй качественный приоритет: помечай каждое действие как [быстро/дёшево], [средне] или [долго/дорого] — без цифр.
+4. Каждое действие должно ссылаться на конкретный домен или query_id ИЗ JSON выше — не изобретай домены или запросы, которых там нет.
+
 Дай разбор в стиле консалтингового отчёта (McKinsey-style), строго по структуре, на русском:
 
-**Ситуация** — 2-3 предложения: что происходит объективно, без оценок.
+**Ситуация** — 2-3 предложения с точными цифрами из JSON, без оценок.
 
-**Вывод** — 2-3 предложения: что это значит для бизнеса, почему это важно, к чему ведёт при сохранении статус-кво.
+**Вывод** — 2-3 предложения: что это значит для бизнеса и к чему ведёт статус-кво. Без новых чисел, которых нет в JSON.
 
-**Что делать** — пронумерованный список из 3-5 КОНКРЕТНЫХ действий, каждое с указанием: что именно сделать, на каком домене/запросе, и ожидаемый эффект. Приоритет — от самого дешёвого/быстрого к более затратному. Никаких общих фраз вроде "улучшить контент" — только конкретика с именами доменов и id запросов из данных выше.
+**Что делать** — пронумерованный список из 3-5 конкретных действий с доменом/query_id из JSON и качественной пометкой приоритета [быстро/дёшево]/[средне]/[долго/дорого]. Проверять эффект каждого действия нужно через блок «⚗ Эксперименты» дашборда, а не через прогноз здесь — так и напиши в конце: "Эффект каждого действия проверяется через ⚗ Эксперименты после публикации, а не оценивается заранее."
 
 Пиши по делу, без вступлений и извинений, сразу с "**Ситуация**"."""
 
@@ -545,61 +582,103 @@ st.write("")
 if not AI_MODELS:
     st.caption("Добавь ANTHROPIC_API_KEY или GEMINI_API_KEY/VERTEX_SA_JSON_B64 в Secrets, чтобы включить AI-разбор")
 else:
+    _ctx_now = build_ai_context(week, provider, brands, own_c, channel_shares(week, provider),
+                                 top_donors(week, provider, limit=8), our_query_matrix(week, provider), NICHE)
+    _hash_now = context_hash(_ctx_now)
+
     model_col, btn_col = st.columns([3, 2])
     with model_col:
         model_choice = st.radio("Аналитик", list(AI_MODELS.keys()), horizontal=True, label_visibility="collapsed")
     model_suffix, analyze_fn = AI_MODELS[model_choice]
     cache_key = f"{provider or 'all'}::{model_suffix}"
     cached = get_cached_insight(week, cache_key)
+    is_stale = cached is not None and cached.get("data_hash") != _hash_now
     with btn_col:
-        gen_clicked = st.button(
-            f"🤖 {'Обновить' if cached else 'Сгенерировать'} разбор от {model_choice}",
-            use_container_width=True)
+        label = "🤖 Обновить AI-разбор" if is_stale else ("🤖 Обновить разбор" if cached else f"🤖 Сгенерировать разбор от {model_choice}")
+        gen_clicked = st.button(label, use_container_width=True)
     if gen_clicked:
         with st.spinner(f"{model_choice} анализирует данные недели..."):
-            ctx = build_ai_context(week, provider, brands, own_c, channel_shares(week, provider),
-                                    top_donors(week, provider, limit=8), our_query_matrix(week, provider), NICHE)
             try:
-                content = analyze_fn(ctx)
-                save_insight(week, cache_key, content)
-                cached = {"content": content, "generated_at": None}
+                content = analyze_fn(_ctx_now)
+                save_insight(week, cache_key, content, _hash_now)
+                cached = {"content": content, "generated_at": None, "data_hash": _hash_now}
+                is_stale = False
             except Exception as e:
                 st.error(f"Ошибка генерации: {e}")
                 cached = None
     if cached:
+        if is_stale:
+            st.warning("⚠ Данные обновились с момента генерации этого разбора — цифры внутри могут не совпадать "
+                       "с текущими карточками выше. Нажми «Обновить AI-разбор», чтобы получить актуальный.")
         st.markdown(f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>{cached["content"]}</div>',
                     unsafe_allow_html=True)
     else:
         st.caption(f"Разбор от {model_choice} ещё не сгенерирован для этого среза — нажми кнопку выше")
 
 st.write("")
-with st.expander("⚗ Эксперименты — записать правку и увидеть эффект"):
+with st.expander("⚗ Эксперименты — гипотеза → действие → измеренный результат"):
     with st.form("new_experiment", clear_on_submit=True):
-        exp_desc = st.text_input("Что сделали (например: добавили /answers на q07)")
-        exp_qid = st.text_input("query_id (необязательно, если правка про конкретный запрос)")
-        exp_url = st.text_input("URL правки (необязательно)")
-        exp_date = st.date_input("Дата правки")
-        submitted = st.form_submit_button("Записать эксперимент")
-        if submitted and exp_desc:
-            log_experiment(exp_date, exp_desc, exp_qid.strip() or None, exp_url.strip() or None)
-            st.success("Записано — дельта появится ниже по мере накопления данных до/после этой даты")
+        st.markdown("**Проблема** (что не так, по данным)")
+        exp_problem = st.text_area("problem", label_visibility="collapsed",
+            placeholder="Например: отсутствуем в q01, q04, q07 — нас не упоминает ни один движок")
+        st.markdown("**Гипотеза**")
+        exp_hyp = st.text_area("hypothesis", label_visibility="collapsed",
+            placeholder="Например: присутствие в источниках, которые цитируют лидеров, повысит видимость")
+        st.markdown("**Действие** (что конкретно сделали)")
+        exp_action = st.text_input("action", label_visibility="collapsed",
+            placeholder="Например: опубликовали 3 отзыва на reddit.com/r/ultralight со ссылкой на merino.tech")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            exp_qid = st.text_input("query_id (опционально)")
+        with c2:
+            exp_url = st.text_input("URL действия (опционально)")
+        with c3:
+            exp_date = st.date_input("Дата начала")
+        submitted = st.form_submit_button("Зафиксировать эксперимент")
+        if submitted and exp_action:
+            qid_clean = exp_qid.strip() or None
+            ours_now = next((b for b in brands if b["is_ours"]), None)
+            baseline = ours_now["sov"] if ours_now else None
+            log_experiment(exp_date, exp_problem.strip() or None, exp_hyp.strip() or None,
+                            exp_action.strip(), qid_clean, exp_url.strip() or None, baseline)
+            st.success(f"Зафиксировано. Baseline SOV на старте: {baseline}%. "
+                       "Проверки через 2/4/8 недель появятся ниже автоматически по мере накопления данных.")
 
     exps = list_experiments()
     if exps:
-        rows_html = ""
         for e in exps:
-            b, a = experiment_effect(e["started_at"], e["query_id"])
-            if b is None or a is None:
-                verdict = '<span style="color:#98A2B5">недостаточно данных до/после</span>'
-            else:
-                d = round(a - b, 1)
-                cls = "up" if d >= 0 else "dn"
-                verdict = f'{b}% → {a}% <span class="delta {cls}" style="margin-left:6px">{d:+.1f} pp</span>'
             scope = f'запрос {e["query_id"]}' if e["query_id"] else "вся ниша"
+            checkpoints_html = ""
+            for wk in (2, 4, 8):
+                wk_date, val = experiment_effect_at(e["started_at"], e["query_id"], wk)
+                if val is None:
+                    cp = f'<span style="color:#98A2B5">через {wk} нед. — ещё рано, данных пока нет</span>'
+                elif e["baseline_sov"] is not None:
+                    d = round(val - float(e["baseline_sov"]), 1)
+                    cls = "up" if d >= 0 else "dn"
+                    cp = (f'через {wk} нед. ({wk_date}): {val}% '
+                          f'<span class="delta {cls}" style="margin-left:4px">{d:+.1f} pp</span>')
+                else:
+                    cp = f'через {wk} нед. ({wk_date}): {val}%'
+                checkpoints_html += f'<div style="font-size:12.5px;color:#1A2233;padding:3px 0">→ {cp}</div>'
+
+            baseline_txt = f'{e["baseline_sov"]}%' if e["baseline_sov"] is not None else "—"
+            body = ""
+            if e.get("problem"):
+                body += f'<div style="margin-top:6px"><b>Проблема:</b> {e["problem"]}</div>'
+            if e.get("hypothesis"):
+                body += f'<div style="margin-top:4px"><b>Гипотеза:</b> {e["hypothesis"]}</div>'
             link = f' · <a href="{e["url"]}" target="_blank" rel="noopener">ссылка</a>' if e["url"] else ""
-            rows_html += (f'<div class="al"><span class="badge b-amb">{e["started_at"]}</span>'
-                          f'<p><b>{e["description"]}</b> ({scope}){link}<br>{verdict}</p></div>')
-        st.markdown(rows_html, unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="al" style="flex-direction:column;align-items:stretch">'
+                f'<div style="display:flex;gap:12px;align-items:flex-start">'
+                f'<span class="badge b-amb">{e["started_at"]}</span>'
+                f'<div style="flex:1">'
+                f'<b>{e["description"]}</b> ({scope}){link}'
+                f'{body}'
+                f'<div style="margin-top:6px;font-size:12px;color:#98A2B5">Baseline SOV: {baseline_txt}</div>'
+                f'{checkpoints_html}'
+                f'</div></div></div>', unsafe_allow_html=True)
     else:
         st.caption("Пока нет ни одного зафиксированного эксперимента")
 
