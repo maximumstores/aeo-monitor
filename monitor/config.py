@@ -19,11 +19,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "")
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
-PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar")
+VERTEX_SA_JSON_B64 = os.getenv("VERTEX_SA_JSON_B64", "")
+VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+SCRAPINGDOG_API_KEY = os.getenv("SCRAPINGDOG_API_KEY", "")
 
 SLEEP_BETWEEN_CALLS = float(os.getenv("AEO_SLEEP", "2"))
 
