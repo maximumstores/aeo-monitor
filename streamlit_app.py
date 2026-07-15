@@ -303,12 +303,25 @@ with left:
     lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
     labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
     legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
+
+    leader = brands[0] if brands else None
+    insights = []
+    if leader and ours and leader["brand"] != ours["brand"]:
+        insights.append(f'Лидер ниши — <b>{leader["brand"]}</b> ({leader["sov"]}% SOV), мы отстаём на {round(leader["sov"]-ours["sov"],1)} п.п.')
+    if own_c < 5:
+        insights.append(f'Own-site цитаты всего <b>{own_c}%</b> — AI почти не читает наш сайт напрямую')
+    top_d = top_donors(week, provider, limit=1)
+    if top_d:
+        insights.append(f'Главный донор ниши — <b>{top_d[0]["domain"]}</b> ({top_d[0]["n"]} цитат)')
+    insight_html = "".join(f'<div style="padding:8px 0;border-top:1px solid #E4E8F0;font-size:13px;color:#1A2233">→ {t}</div>' for t in insights)
+
     st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice — {choice}</h2>'
         f'<svg viewBox="0 0 600 165" width="100%">'
         f'<line x1="30" y1="130" x2="590" y2="130" stroke="#E4E8F0"/>'
         f'<line x1="30" y1="75" x2="590" y2="75" stroke="#EEF1F6"/>'
         f'<text x="4" y="78">50</text><text x="12" y="133">0</text>'
-        f'{lines}{labels}</svg><div class="legend">{legend}</div></div>', unsafe_allow_html=True)
+        f'{lines}{labels}</svg><div class="legend">{legend}</div>'
+        f'<div style="margin-top:16px">{insight_html}</div></div>', unsafe_allow_html=True)
 with right:
     rows = "".join(f'<div class="crow"><span class="nm">{CH_LAB.get(c["source_type"],c["source_type"])}</span>'
         f'<div class="cbar"><i style="width:{c["pct"]}%;background:{CH_COL.get(c["source_type"],"#98A2B5")}"></i></div>'
