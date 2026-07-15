@@ -322,7 +322,17 @@ def build_ai_context(week, provider, brands, own_c, channels, donors, qmatrix, n
         ]
         payload["queries_with_zero_mentions_count"] = len(zero)
         payload["queries_total_count"] = len(grid)
-    return _json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _json_default(o):
+        try:
+            from decimal import Decimal
+            if isinstance(o, Decimal):
+                return float(o)
+        except ImportError:
+            pass
+        return str(o)
+
+    return _json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
 
 
 def context_hash(context_text):
