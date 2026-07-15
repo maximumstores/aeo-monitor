@@ -368,7 +368,7 @@ st.markdown("""<style>
 .aeo-logo{font-family:Manrope;font-weight:800;font-size:22px;color:#1A2233}
 .aeo-logo span{color:#3D5AFE}
 .aeo-meta{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#98A2B5;text-transform:uppercase;margin-top:2px}
-.card{background:#FFF;border:1px solid #E4E8F0;border-radius:16px;padding:18px;height:100%}
+.card{background:#FFF;border:1px solid #E4E8F0;border-radius:16px;padding:18px}
 .lab{font-size:12px;color:#98A2B5;font-weight:500;margin-bottom:6px}
 .big{font-family:Manrope;font-weight:800;font-size:29px;color:#1A2233;letter-spacing:-.02em}
 .delta{display:inline-block;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;border-radius:999px;padding:2px 9px;margin-top:8px}
@@ -458,19 +458,6 @@ st.write("")
 
 left, right = st.columns([1.7, 1])
 with left:
-    trend = sov_trend(provider)
-    series = ([(ours["brand"], "#12946A", 2.6)] if ours else []) + \
-        [(b, ["#C6CCDA","#8FB4F9"][i], 1.5)
-         for i, b in enumerate([x["brand"] for x in brands if not x["is_ours"]][:2])]
-    W,H,X,Y = 560,110,30,20
-    step = W/max(len(wks)-1,1)
-    def pts(brand):
-        vals = {r["week_start"]: float(r["sov"]) for r in trend if r["brand"]==brand}
-        return " ".join(f"{X+i*step:.0f},{Y+H-(vals.get(w,0)/100)*H:.0f}" for i,w in enumerate(wks))
-    lines = "".join(f'<polyline points="{pts(b)}" fill="none" stroke="{c}" stroke-width="{sw}" stroke-linecap="round"/>' for b,c,sw in series)
-    lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
-    labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
-    legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
     leader = brands[0] if brands else None
     insights = []
     if leader and ours and leader["brand"] != ours["brand"]:
@@ -482,13 +469,32 @@ with left:
         insights.append(f'Главный донор ниши — <b>{top_d[0]["domain"]}</b> ({top_d[0]["n"]} цитат)')
     insight_html = "".join(f'<div style="padding:8px 0;border-top:1px solid #E4E8F0;font-size:13px;color:#1A2233">→ {t}</div>' for t in insights)
 
-    st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice — {choice}</h2>'
-        f'<svg viewBox="0 0 600 165" width="100%">'
-        f'<line x1="30" y1="130" x2="590" y2="130" stroke="#E4E8F0"/>'
-        f'<line x1="30" y1="75" x2="590" y2="75" stroke="#EEF1F6"/>'
-        f'<text x="4" y="78">50</text><text x="12" y="133">0</text>'
-        f'{lines}{labels}</svg><div class="legend">{legend}</div>'
-        f'<div style="margin-top:16px">{insight_html}</div></div>', unsafe_allow_html=True)
+    if len(wks) < 2:
+        st.markdown(f'<div class="card"><h2 class="sec">Выводы недели — {choice}</h2>'
+            f'<p style="font-size:12.5px;color:#98A2B5;margin:0 0 4px">График тренда появится, когда накопится 2+ недели данных</p>'
+            f'<div style="margin-top:8px">{insight_html}</div></div>', unsafe_allow_html=True)
+    else:
+        trend = sov_trend(provider)
+        series = ([(ours["brand"], "#12946A", 2.6)] if ours else []) + \
+            [(b, ["#C6CCDA","#8FB4F9"][i], 1.5)
+             for i, b in enumerate([x["brand"] for x in brands if not x["is_ours"]][:2])]
+        W,H,X,Y = 560,110,30,20
+        step = W/max(len(wks)-1,1)
+        def pts(brand):
+            vals = {r["week_start"]: float(r["sov"]) for r in trend if r["brand"]==brand}
+            return " ".join(f"{X+i*step:.0f},{Y+H-(vals.get(w,0)/100)*H:.0f}" for i,w in enumerate(wks))
+        lines = "".join(f'<polyline points="{pts(b)}" fill="none" stroke="{c}" stroke-width="{sw}" stroke-linecap="round"/>' for b,c,sw in series)
+        lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
+        labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
+        legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
+
+        st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice — {choice}</h2>'
+            f'<svg viewBox="0 0 600 165" width="100%">'
+            f'<line x1="30" y1="130" x2="590" y2="130" stroke="#E4E8F0"/>'
+            f'<line x1="30" y1="75" x2="590" y2="75" stroke="#EEF1F6"/>'
+            f'<text x="4" y="78">50</text><text x="12" y="133">0</text>'
+            f'{lines}{labels}</svg><div class="legend">{legend}</div>'
+            f'<div style="margin-top:16px">{insight_html}</div></div>', unsafe_allow_html=True)
 with right:
     rows = "".join(f'<div class="crow"><span class="nm">{CH_LAB.get(c["source_type"],c["source_type"])}</span>'
         f'<div class="cbar"><i style="width:{c["pct"]}%;background:{CH_COL.get(c["source_type"],"#98A2B5")}"></i></div>'
