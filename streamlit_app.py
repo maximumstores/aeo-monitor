@@ -338,6 +338,56 @@ def build_ai_context(week, provider, brands, own_c, channels, donors, qmatrix, n
 def context_hash(context_text):
     return hashlib.sha256(context_text.encode("utf-8")).hexdigest()[:12]
 
+
+PRIORITY_LABEL = {"fast_cheap": "быстро / дёшево", "medium": "средне", "slow_expensive": "долго / дорого"}
+PRIORITY_COLOR = {"fast_cheap": ("#E1F5EC", "#12946A"), "medium": ("#FBF1DC", "#C07E14"),
+                   "slow_expensive": ("#FBE9E4", "#D6452C")}
+
+
+def render_ai_report(content_json, model_choice, choice):
+    """Рендерит структурированный JSON-разбор карточками. Фолбэк на обычный markdown
+    для legacy-записей, сохранённых до перехода на JSON-формат."""
+    import json as _json
+    try:
+        data = _json.loads(content_json)
+        situation, conclusion = data["situation"], data["conclusion"]
+        actions = data.get("actions", [])
+    except (_json.JSONDecodeError, KeyError, TypeError):
+        st.markdown(f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>'
+                    f'{content_json}</div>', unsafe_allow_html=True)
+        return
+
+    action_cards = ""
+    for a in actions:
+        bg, fg = PRIORITY_COLOR.get(a.get("priority"), ("#EEF1F6", "#5B6577"))
+        label = PRIORITY_LABEL.get(a.get("priority"), a.get("priority", "—"))
+        action_cards += (
+            f'<div style="background:#FAFBFC;border:1px solid #E4E8F0;border-radius:10px;'
+            f'padding:12px 14px;margin-bottom:8px">'
+            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">'
+            f'<b style="font-size:14px;color:#1A2233">{a.get("title","")}</b>'
+            f'<span style="background:{bg};color:{fg};font-family:\'IBM Plex Mono\',monospace;'
+            f'font-size:10.5px;font-weight:600;padding:2px 9px;border-radius:999px;white-space:nowrap">{label}</span>'
+            f'</div><div style="font-size:13px;color:#4E5C53;margin-top:5px;line-height:1.5">{a.get("detail","")}</div>'
+            f'</div>')
+
+    st.markdown(
+        f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>'
+        f'<div style="margin-bottom:14px">'
+        f'<div class="lab">Ситуация</div>'
+        f'<div style="font-size:13.5px;color:#1A2233;line-height:1.6">{situation}</div>'
+        f'</div>'
+        f'<div style="margin-bottom:14px;padding:12px 14px;background:#F4F6FA;border-radius:10px;'
+        f'border-left:3px solid #3D5AFE">'
+        f'<div class="lab">Вывод</div>'
+        f'<div style="font-size:13.5px;color:#1A2233;line-height:1.6">{conclusion}</div>'
+        f'</div>'
+        f'<div class="lab" style="margin-bottom:8px">Что делать</div>'
+        f'{action_cards}'
+        f'<p style="font-size:11.5px;color:#98A2B5;margin-top:6px">Эффект каждого действия проверяется через '
+        f'⚗ Эксперименты после публикации, а не оценивается заранее.</p>'
+        f'</div>', unsafe_allow_html=True)
+
 def _build_report_prompt(context_text):
     return f"""Ты — консультант по GEO/AEO-стратегии (видимость бренда в ответах AI-агентов).
 Ниже JSON-снапшот недельного мониторинга бренда в ответах Gemini/Claude/ChatGPT/Google по покупательским запросам ниши.
@@ -345,25 +395,43 @@ def _build_report_prompt(context_text):
 {context_text}
 
 СТРОГИЕ ПРАВИЛА ТОЧНОСТИ (обязательны, нарушение недопустимо):
-1. Используй ТОЛЬКО числа, буквально присутствующие в JSON выше. Никогда не пересчитывай, не округляй иначе и не придумывай проценты, доли, счётчики цитат — копируй их из JSON дословно (те же значения и то же число знаков после запятой).
-2. НЕ придумывай прогнозные числа: никаких "+X п.п. за Y недель", никаких сумм в долларах, никаких таймлайнов вида "4-6 недель". У нас пока нет исторических данных, чтобы такие оценки были правдой, а не выдумкой — их отсутствие в JSON означает, что их не существует.
-3. Вместо числовых прогнозов используй качественный приоритет: помечай каждое действие как [быстро/дёшево], [средне] или [долго/дорого] — без цифр.
-4. Каждое действие должно ссылаться на конкретный домен или query_id ИЗ JSON выше — не изобретай домены или запросы, которых там нет.
+1. Используй ТОЛЬКО числа, буквально присутствующие в JSON выше. Никогда не пересчитывай, не округляй иначе и не придумывай проценты, доли, счётчики цитат — копируй их из JSON дословно.
+2. НЕ придумывай прогнозные числа: никаких "+X п.п. за Y недель", никаких сумм в долларах, никаких таймлайнов. У нас нет исторических данных для таких оценок.
+3. Каждое действие должно ссылаться на конкретный домен или query_id ИЗ JSON выше — не изобретай домены или запросы, которых там нет.
+4. Приоритет каждого действия — строго одно из трёх значений: "fast_cheap", "medium", "slow_expensive" (без чисел, только эта категория).
 
-Дай разбор в стиле консалтингового отчёта (McKinsey-style), строго по структуре, на русском:
+ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON, без markdown-обёртки (без ```), без пояснений до или после. Схема:
+{{
+  "situation": "2-3 предложения с точными цифрами из JSON выше, без оценок",
+  "conclusion": "2-3 предложения: что это значит для бизнеса и к чему ведёт статус-кво, без новых чисел",
+  "actions": [
+    {{"title": "короткий заголовок действия (3-6 слов)",
+      "detail": "конкретика: что сделать, на каком домене/query_id, зачем",
+      "priority": "fast_cheap"}}
+  ]
+}}
 
-**Ситуация** — 2-3 предложения с точными цифрами из JSON, без оценок.
-
-**Вывод** — 2-3 предложения: что это значит для бизнеса и к чему ведёт статус-кво. Без новых чисел, которых нет в JSON.
-
-**Что делать** — пронумерованный список из 3-5 конкретных действий с доменом/query_id из JSON и качественной пометкой приоритета [быстро/дёшево]/[средне]/[долго/дорого]. Проверять эффект каждого действия нужно через блок «⚗ Эксперименты» дашборда, а не через прогноз здесь — так и напиши в конце: "Эффект каждого действия проверяется через ⚗ Эксперименты после публикации, а не оценивается заранее."
-
-Пиши по делу, без вступлений и извинений, сразу с "**Ситуация**"."""
+В "actions" — от 3 до 5 пунктов, отсортированных от fast_cheap к slow_expensive."""
 
 
+
+
+def _extract_json(raw):
+    """Снимает возможную ```json обёртку и парсит. Кидает исключение, если не JSON."""
+    import json as _json
+    t = raw.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.startswith("json"):
+            t = t[4:]
+        t = t.strip()
+    data = _json.loads(t)
+    assert "situation" in data and "conclusion" in data and "actions" in data
+    return data
 
 
 def ai_analyze(context_text):
+    import json as _json
     import anthropic
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -372,7 +440,9 @@ def ai_analyze(context_text):
         max_tokens=1500,
         messages=[{"role": "user", "content": _build_report_prompt(context_text)}],
     )
-    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    data = _extract_json(raw)
+    return _json.dumps(data, ensure_ascii=False)
 
 
 def ai_analyze_gemini(context_text):
@@ -398,7 +468,9 @@ def ai_analyze_gemini(context_text):
         contents=_build_report_prompt(context_text),
         config=types.GenerateContentConfig(),
     )
-    return resp.text or ""
+    raw = resp.text or ""
+    data = _extract_json(raw)
+    return json.dumps(data, ensure_ascii=False)
 
 
 AI_MODELS = {}
@@ -620,8 +692,7 @@ else:
         if is_stale:
             st.warning("⚠ Данные обновились с момента генерации этого разбора — цифры внутри могут не совпадать "
                        "с текущими карточками выше. Нажми «Обновить AI-разбор», чтобы получить актуальный.")
-        st.markdown(f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>{cached["content"]}</div>',
-                    unsafe_allow_html=True)
+        render_ai_report(cached["content"], model_choice, choice)
     else:
         st.caption(f"Разбор от {model_choice} ещё не сгенерирован для этого среза — нажми кнопку выше")
 
