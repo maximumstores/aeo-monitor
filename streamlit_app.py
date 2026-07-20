@@ -84,6 +84,30 @@ CREATE TABLE IF NOT EXISTS aeo.ai_insights (
     generated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (week_start, provider));
 ALTER TABLE aeo.ai_insights ADD COLUMN IF NOT EXISTS data_hash text;
+
+CREATE TABLE IF NOT EXISTS aeo.factcheck_flags (
+    week_start date NOT NULL,
+    query_id text NOT NULL,
+    provider text NOT NULL,
+    claim text NOT NULL,
+    fact text NOT NULL,
+    mismatch boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now());
+
+CREATE TABLE IF NOT EXISTS aeo.ai_traffic (
+    week_start date NOT NULL PRIMARY KEY,
+    ai_sessions int,
+    ai_orders int,
+    ai_revenue numeric,
+    note text,
+    updated_at timestamptz NOT NULL DEFAULT now());
+
+CREATE TABLE IF NOT EXISTS aeo.site_audits (
+    url text NOT NULL PRIMARY KEY,
+    score int,
+    content text NOT NULL,
+    content_hash text NOT NULL,
+    generated_at timestamptz NOT NULL DEFAULT now());
 """
 with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
@@ -229,6 +253,43 @@ def brand_candidates(week):
     return _rows("""SELECT brand, mention_count FROM aeo.brand_candidates
         WHERE week_start=%s ORDER BY mention_count DESC""", (week,))
 
+def factcheck_flags(week):
+    return _rows("""SELECT query_id, provider, claim, fact, mismatch
+        FROM aeo.factcheck_flags WHERE week_start=%s ORDER BY mismatch DESC, query_id""", (week,))
+
+def ai_traffic_row(week):
+    r = _rows("SELECT ai_sessions, ai_orders, ai_revenue, note FROM aeo.ai_traffic WHERE week_start=%s", (week,))
+    return r[0] if r else None
+
+def ai_traffic_trend():
+    return _rows("SELECT week_start, ai_sessions, ai_orders, ai_revenue FROM aeo.ai_traffic ORDER BY week_start")
+
+def save_ai_traffic(week, sessions, orders, revenue, note):
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute("""INSERT INTO aeo.ai_traffic (week_start, ai_sessions, ai_orders, ai_revenue, note, updated_at)
+            VALUES (%s,%s,%s,%s,%s,now())
+            ON CONFLICT (week_start) DO UPDATE SET
+              ai_sessions=EXCLUDED.ai_sessions, ai_orders=EXCLUDED.ai_orders,
+              ai_revenue=EXCLUDED.ai_revenue, note=EXCLUDED.note, updated_at=now()""",
+            (week, sessions, orders, revenue, note))
+        conn.commit()
+    _rows.clear()
+
+def get_cached_audit(url):
+    r = _rows("SELECT score, content, content_hash, generated_at FROM aeo.site_audits WHERE url=%s", (url,))
+    return r[0] if r else None
+
+def save_audit(url, score, content_json, content_hash):
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute("""INSERT INTO aeo.site_audits (url, score, content, content_hash, generated_at)
+            VALUES (%s,%s,%s,%s,now())
+            ON CONFLICT (url) DO UPDATE SET
+              score=EXCLUDED.score, content=EXCLUDED.content,
+              content_hash=EXCLUDED.content_hash, generated_at=now()""",
+            (url, score, content_json, content_hash))
+        conn.commit()
+    _rows.clear()
+
 def list_experiments():
     return _rows("SELECT id, started_at, description, query_id, url FROM aeo.experiments ORDER BY started_at DESC")
 
@@ -337,6 +398,93 @@ def build_ai_context(week, provider, brands, own_c, channels, donors, qmatrix, n
 
 def context_hash(context_text):
     return hashlib.sha256(context_text.encode("utf-8")).hexdigest()[:12]
+
+
+def fetch_page_for_audit(url):
+    """Скачивает страницу сама (без AI web_search — надёжнее и дешевле для конкретного URL).
+    Возвращает: raw_html, jsonld_blocks (список сырых JSON-LD скриптов), visible_text, llms_txt_status."""
+    import re
+    import requests
+    from urllib.parse import urlparse
+
+    resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (AEO-Radar-Audit)"})
+    resp.raise_for_status()
+    html = resp.text
+
+    jsonld_pattern = "<script[^>]+type=[\"']application/ld\\+json[\"'][^>]*>(.*?)</script>"
+    jsonld_blocks = re.findall(jsonld_pattern, html, flags=re.IGNORECASE | re.DOTALL)
+
+    no_script = re.sub(r'<script.*?</script>', ' ', html, flags=re.IGNORECASE | re.DOTALL)
+    no_style = re.sub(r'<style.*?</style>', ' ', no_script, flags=re.IGNORECASE | re.DOTALL)
+    visible_text = re.sub(r'<[^>]+>', ' ', no_style)
+    visible_text = re.sub(r'\s+', ' ', visible_text).strip()[:4000]
+
+    domain = urlparse(url).scheme + "://" + urlparse(url).netloc
+    try:
+        r2 = requests.get(domain + "/llms.txt", timeout=10)
+        llms_txt_status = "найден" if r2.status_code == 200 else f"не найден (код {r2.status_code})"
+    except Exception:
+        llms_txt_status = "не найден (ошибка запроса)"
+
+    return {
+        "jsonld_blocks": jsonld_blocks[:5],
+        "visible_text": visible_text,
+        "llms_txt_status": llms_txt_status,
+        "raw_len": len(html),
+    }
+
+
+def build_audit_prompt(url, extracted, catalog_facts):
+    import json as _json
+    facts_str = _json.dumps(catalog_facts, ensure_ascii=False) if catalog_facts else "не заданы"
+    jsonld_str = "\n---\n".join(extracted["jsonld_blocks"]) if extracted["jsonld_blocks"] else "не найдено ни одного JSON-LD блока"
+
+    return f"""Ты — аудитор "agent readiness" (готовности страницы к машинному чтению AI-агентами).
+
+URL: {url}
+llms.txt на сайте: {extracted["llms_txt_status"]}
+Найденные JSON-LD блоки на странице:
+{jsonld_str}
+
+Видимый текст страницы (первые 4000 симв.):
+{extracted["visible_text"]}
+
+Реальные факты о товаре (наш каталог, для сверки точности разметки):
+{facts_str}
+
+Проверь страницу по чек-листу agent readiness и ответь СТРОГО JSON (без markdown-обёртки):
+{{
+  "score": 0-100,
+  "findings": [
+    {{"check": "Product/Offer JSON-LD", "status": "ok"|"missing"|"mismatch", "detail": "..."}},
+    {{"check": "Review/AggregateRating JSON-LD", "status": "...", "detail": "..."}},
+    {{"check": "FAQPage разметка", "status": "...", "detail": "..."}},
+    {{"check": "llms.txt", "status": "...", "detail": "..."}},
+    {{"check": "машиночитаемые атрибуты (GSM/состав/размеры) в тексте или JSON-LD", "status": "...", "detail": "..."}}
+  ],
+  "recommendations": ["конкретное действие 1", "конкретное действие 2"]
+}}
+score считай как процент чек-листа со статусом ok. Будь строг: если JSON-LD пуст — Product/Offer это "missing", не "ok"."""
+
+
+def run_site_audit(url, catalog_facts):
+    import json as _json
+    extracted = fetch_page_for_audit(url)
+    prompt = build_audit_prompt(url, extracted, catalog_facts)
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model="claude-sonnet-4-5", max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    data = _extract_json(raw)
+    assert "score" in data and "findings" in data
+    content_hash = hashlib.sha256(
+        (extracted["visible_text"] + "".join(extracted["jsonld_blocks"])).encode("utf-8")
+    ).hexdigest()[:12]
+    return _json.dumps(data, ensure_ascii=False), data.get("score"), content_hash
 
 
 PRIORITY_LABEL = {"fast_cheap": "быстро / дёшево", "medium": "средне", "slow_expensive": "долго / дорого"}
@@ -762,6 +910,106 @@ with st.expander("⚗ Эксперименты — гипотеза → дейс
                 f'</div></div></div>', unsafe_allow_html=True)
     else:
         st.caption("Пока нет ни одного зафиксированного эксперимента")
+
+st.write("")
+# ── Rung 2: Фактчек бренда ──
+fc = factcheck_flags(week)
+mismatches = [f for f in fc if f["mismatch"]]
+if fc:
+    if mismatches:
+        rows_html = "".join(
+            f'<div class="al"><span class="badge b-red">{f["query_id"]}·{P_SHORT.get(f["provider"], f["provider"].upper())}</span>'
+            f'<p><b>AI утверждает:</b> {f["claim"]}<br><b>На самом деле:</b> {f["fact"]}</p></div>'
+            for f in mismatches)
+        st.markdown(f'<div class="card"><h2 class="sec">✓ Фактчек бренда — найдено расхождений: {len(mismatches)}</h2>{rows_html}</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><h2 class="sec">✓ Фактчек бренда</h2>'
+                     '<p style="font-size:13px;color:#12946A">Расхождений с каталогом не найдено на этой неделе.</p></div>',
+                     unsafe_allow_html=True)
+else:
+    st.caption("Фактчек ещё не запускался для этой недели (нужен catalog_facts в queries.yaml)")
+
+st.write("")
+# ── Rung 3: AI-трафик → заказы (ручной ввод до подключения Shopify/GA4 API) ──
+with st.expander("📈 AI-трафик → заказы (Demand — мост к деньгам)"):
+    existing = ai_traffic_row(week)
+    with st.form("ai_traffic_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sessions_in = st.number_input("Сессии с AI-рефереров (chatgpt.com, perplexity.ai, ...)",
+                min_value=0, value=int(existing["ai_sessions"]) if existing and existing["ai_sessions"] else 0)
+        with c2:
+            orders_in = st.number_input("Заказы из этих сессий",
+                min_value=0, value=int(existing["ai_orders"]) if existing and existing["ai_orders"] else 0)
+        with c3:
+            revenue_in = st.number_input("Выручка ($)",
+                min_value=0.0, value=float(existing["ai_revenue"]) if existing and existing["ai_revenue"] else 0.0, step=10.0)
+        note_in = st.text_input("Заметка (опционально)", value=existing["note"] if existing and existing.get("note") else "")
+        if st.form_submit_button("Сохранить данные недели"):
+            save_ai_traffic(week, int(sessions_in), int(orders_in), float(revenue_in), note_in.strip() or None)
+            st.success("Сохранено")
+
+    trend = ai_traffic_trend()
+    if len(trend) >= 2:
+        rows_html = "".join(
+            f'<div class="crow"><span class="nm">{r["week_start"]}</span>'
+            f'<span style="flex:1;font-family:\'IBM Plex Mono\',monospace;font-size:12px;color:#5B6577">'
+            f'{r["ai_sessions"] or 0} сессий · {r["ai_orders"] or 0} заказов · ${r["ai_revenue"] or 0:.0f}</span></div>'
+            for r in trend)
+        st.markdown(f'<div class="lab" style="margin-top:10px">История</div>{rows_html}', unsafe_allow_html=True)
+    else:
+        st.caption("Заполни хотя бы 2 недели, чтобы увидеть тренд AI-трафика рядом с трендом SOV")
+
+st.write("")
+# ── Agent Readiness: аудит страницы сайта ──
+with st.expander("🔍 Аудит сайта — Agent Readiness"):
+    audit_url = st.text_input("URL страницы для проверки", placeholder="https://merino.tech/products/base-layer")
+    audit_col1, audit_col2 = st.columns([3, 2])
+    cached_audit = get_cached_audit(audit_url) if audit_url else None
+    with audit_col2:
+        audit_clicked = st.button(
+            "🔍 Обновить аудит" if cached_audit else "🔍 Запустить аудит",
+            use_container_width=True, disabled=not audit_url)
+    if audit_clicked and audit_url:
+        if not ANTHROPIC_API_KEY:
+            st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
+        else:
+            with st.spinner("Скачиваю страницу и анализирую..."):
+                try:
+                    catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
+                    content_json, score, chash = run_site_audit(audit_url, catalog_facts)
+                    save_audit(audit_url, score, content_json, chash)
+                    cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
+                except Exception as e:
+                    st.error(f"Ошибка аудита: {e}")
+                    cached_audit = None
+    if cached_audit:
+        import json as _json2
+        try:
+            adata = _json2.loads(cached_audit["content"])
+            score = cached_audit["score"] or 0
+            score_color = "#12946A" if score >= 70 else "#C07E14" if score >= 40 else "#D6452C"
+            findings_html = "".join(
+                f'<div class="al"><span class="badge" style="background:'
+                f'{"#E1F5EC" if f["status"]=="ok" else "#FBF1DC" if f["status"]=="mismatch" else "#FBE9E4"};'
+                f'color:{"#12946A" if f["status"]=="ok" else "#C07E14" if f["status"]=="mismatch" else "#D6452C"}">'
+                f'{f["status"]}</span><p><b>{f["check"]}</b><br>{f["detail"]}</p></div>'
+                for f in adata.get("findings", []))
+            recs_html = "".join(f'<li style="font-size:13px;color:#1A2233;margin-bottom:4px">{r}</li>'
+                                for r in adata.get("recommendations", []))
+            st.markdown(
+                f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h2 class="sec" style="margin:0">Agent readiness score</h2>'
+                f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
+                f'<div style="margin-top:10px">{findings_html}</div>'
+                f'<div class="lab" style="margin-top:12px">Что делать</div>'
+                f'<ul style="margin:4px 0 0;padding-left:18px">{recs_html}</ul></div>',
+                unsafe_allow_html=True)
+        except Exception:
+            st.caption("Не удалось разобрать сохранённый результат — запусти аудит заново")
+    else:
+        st.caption("Введи URL и нажми «Запустить аудит»")
 
 st.write("")
 cands = brand_candidates(week)
