@@ -967,24 +967,24 @@ with st.expander("🕷️ Доступность для AI-краулеров (�
                 st.caption("Введи URL конкурента, чтобы сравнить доступность бок о бок")
 
 st.write("")
-# ── Agent Readiness: аудит страницы сайта ──
-with st.expander("🔍 Аудит сайта — Agent Readiness"):
-    audit_url = st.text_input("URL страницы для проверки", placeholder="https://merino.tech/products/base-layer")
-    audit_col1, audit_col2 = st.columns([3, 2])
-    cached_audit = get_cached_audit(audit_url) if audit_url else None
-    with audit_col2:
-        audit_clicked = st.button(
-            "🔍 Обновить аудит" if cached_audit else "🔍 Запустить аудит",
-            use_container_width=True, disabled=not audit_url)
-    if audit_clicked and audit_url:
+# ── Agent Readiness: аудит страницы сайта (наш сайт + опционально чужой) ──
+def _run_audit_and_show(url, label):
+    if not url:
+        st.caption(f"{label}: введи URL, чтобы запустить аудит")
+        return
+    cached_audit = get_cached_audit(url)
+    clicked = st.button(
+        f"🔍 {'Обновить' if cached_audit else 'Запустить'} аудит — {label}",
+        use_container_width=True, key=f"audit_btn_{label}")
+    if clicked:
         if not ANTHROPIC_API_KEY:
             st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
         else:
             with st.spinner("Скачиваю страницу и анализирую..."):
                 try:
                     catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
-                    content_json, score, chash = run_site_audit(audit_url, catalog_facts)
-                    save_audit(audit_url, score, content_json, chash)
+                    content_json, score, chash = run_site_audit(url, catalog_facts)
+                    save_audit(url, score, content_json, chash)
                     cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
                 except Exception as e:
                     st.error(f"Ошибка аудита: {e}")
@@ -1005,7 +1005,7 @@ with st.expander("🔍 Аудит сайта — Agent Readiness"):
                                 for r in adata.get("recommendations", []))
             st.markdown(
                 f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h2 class="sec" style="margin:0">Agent readiness score</h2>'
+                f'<h2 class="sec" style="margin:0">{label}</h2>'
                 f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
                 f'<div style="margin-top:10px">{findings_html}</div>'
                 f'<div class="lab" style="margin-top:12px">Что делать</div>'
@@ -1014,7 +1014,21 @@ with st.expander("🔍 Аудит сайта — Agent Readiness"):
         except Exception:
             st.caption("Не удалось разобрать сохранённый результат — запусти аудит заново")
     else:
-        st.caption("Введи URL и нажми «Запустить аудит»")
+        st.caption(f"{label}: ещё не проверялся — нажми кнопку выше")
+
+
+with st.expander("🔍 Аудит сайта — Agent Readiness"):
+    default_audit_own = default_own.rstrip("/") + "/products/base-layer" if "default_own" in dir() else "https://merino.tech/products/base-layer"
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        own_audit_url = st.text_input("Наш сайт", value=default_audit_own, key="own_audit_url")
+        _run_audit_and_show(own_audit_url, "Наш сайт")
+    with ac2:
+        other_audit_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_audit_url")
+        if other_audit_url:
+            _run_audit_and_show(other_audit_url, "Чужой сайт")
+        else:
+            st.caption("Введи URL конкурента, чтобы сравнить agent readiness бок о бок")
 
 st.write("")
 # ── Rung 2: Фактчек бренда ──
