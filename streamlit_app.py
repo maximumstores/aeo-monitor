@@ -194,6 +194,208 @@ def sov_trend(provider=None):
 def channel_shares(week, provider=None):
     pc, pp = _prov_clause(provider)
     return _rows(f"""SELECT source_type, count(*) AS n,
+        round(100.0*count(*)/sum(count(*)) OVER (),0) AS pct# -*- coding: utf-8 -*-
+"""AEO Radar — дашборд, всё в одном файле. Секрет: DATABASE_URL."""
+import hashlib
+import os
+import re
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    import crawler_check
+    HAS_CRAWLER_CHECK = True
+except ImportError:
+    HAS_CRAWLER_CHECK = False
+
+import psycopg2
+import psycopg2.extras
+import streamlit as st
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL:
+    try:
+        DATABASE_URL = st.secrets["DATABASE_URL"]
+    except Exception:
+        pass
+
+st.set_page_config(page_title="AEO Radar", page_icon="◎", layout="wide")
+
+if not DATABASE_URL:
+    st.error("DATABASE_URL не найден в Secrets")
+    st.stop()
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+if not ANTHROPIC_API_KEY:
+    try:
+        ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+VERTEX_SA_JSON_B64 = os.getenv("VERTEX_SA_JSON_B64", "")
+VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+for _k in ("GEMINI_API_KEY", "VERTEX_SA_JSON_B64", "VERTEX_PROJECT", "VERTEX_LOCATION"):
+    if not globals()[_k]:
+        try:
+            globals()[_k] = st.secrets[_k]
+        except Exception:
+            pass
+
+DDL = """
+CREATE SCHEMA IF NOT EXISTS aeo;
+CREATE TABLE IF NOT EXISTS aeo.responses (
+    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
+    query_text text NOT NULL, response_text text,
+    fetched_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (week_start, query_id, provider));
+CREATE TABLE IF NOT EXISTS aeo.mentions (
+    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
+    brand text NOT NULL, is_ours boolean NOT NULL DEFAULT false,
+    mentioned boolean NOT NULL DEFAULT false, first_position int,
+    mention_count int NOT NULL DEFAULT 0,
+    PRIMARY KEY (week_start, query_id, provider, brand));
+CREATE TABLE IF NOT EXISTS aeo.citations (
+    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
+    url text NOT NULL, domain text NOT NULL, position int,
+    is_ours boolean NOT NULL DEFAULT false,
+    source_type text NOT NULL DEFAULT 'third_party', title text,
+    fetched_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (week_start, query_id, provider, url));
+CREATE TABLE IF NOT EXISTS aeo.brand_candidates (
+    week_start date NOT NULL,
+    brand text NOT NULL,
+    mention_count int NOT NULL DEFAULT 1,
+    status text NOT NULL DEFAULT 'new',
+    PRIMARY KEY (week_start, brand));
+CREATE TABLE IF NOT EXISTS aeo.experiments (
+    id serial PRIMARY KEY,
+    started_at date NOT NULL DEFAULT current_date,
+    description text NOT NULL,
+    query_id text,
+    url text,
+    created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS problem text;
+ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS hypothesis text;
+ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS baseline_sov numeric;
+CREATE TABLE IF NOT EXISTS aeo.ai_insights (
+    week_start date NOT NULL,
+    provider text NOT NULL DEFAULT 'all',
+    content text NOT NULL,
+    generated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (week_start, provider));
+ALTER TABLE aeo.ai_insights ADD COLUMN IF NOT EXISTS data_hash text;
+
+CREATE TABLE IF NOT EXISTS aeo.factcheck_flags (
+    week_start date NOT NULL,
+    query_id text NOT NULL,
+    provider text NOT NULL,
+    claim text NOT NULL,
+    fact text NOT NULL,
+    mismatch boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now());
+
+CREATE TABLE IF NOT EXISTS aeo.ai_traffic (
+    week_start date NOT NULL PRIMARY KEY,
+    ai_sessions int,
+    ai_orders int,
+    ai_revenue numeric,
+    note text,
+    updated_at timestamptz NOT NULL DEFAULT now());
+
+CREATE TABLE IF NOT EXISTS aeo.site_audits (
+    url text NOT NULL PRIMARY KEY,
+    score int,
+    content text NOT NULL,
+    content_hash text NOT NULL,
+    generated_at timestamptz NOT NULL DEFAULT now());
+"""
+with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
+    _cur.execute(DDL)
+    _c.commit()
+
+NICHE, N_QUERIES = "merino.tech", 16
+ALIASES = [NICHE]
+try:
+    import yaml
+    _cfg = yaml.safe_load(Path("queries.yaml").read_text(encoding="utf-8"))
+    NICHE = (_cfg.get("brands", {}).get("ours") or [NICHE])[0]
+    N_QUERIES = len(_cfg.get("queries", [])) or N_QUERIES
+    ALIASES = _cfg.get("aliases", {}).get(NICHE, [NICHE]) or [NICHE]
+except Exception:
+    pass
+
+def highlight_brand(text, aliases):
+    if not text or not aliases:
+        return text
+    pattern = "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
+    return re.sub(
+        f"({pattern})",
+        r'<mark style="background:#FFE58A;color:#1A2233;padding:1px 3px;'
+        r'border-radius:3px;font-weight:700">\1</mark>',
+        text, flags=re.IGNORECASE,
+    )
+
+def favicon(domain):
+    return f'https://www.google.com/s2/favicons?domain={domain}&sz=32'
+
+
+def source_row(domain, url, source_type, is_ours, title=None, mine=False):
+    """Единая карточка источника: favicon + домен-ссылка + заголовок + тип."""
+    t = (title or "")[:80]
+    subtitle = f'<div style="font-size:11px;color:{"#8A6D00" if mine else "#98A2B5"};font-weight:400;white-space:normal;line-height:1.3;margin-top:1px">{t}</div>' if t else ""
+    if mine:
+        return (f'<div class="donor" style="background:#FFF6D9;border-radius:6px;padding:7px 9px;margin:3px 0;'
+                f'border:1px solid #FFE58A;align-items:flex-start">'
+                f'<img src="{favicon(domain)}" width="16" height="16" style="margin-top:2px;border-radius:3px;flex-shrink:0">'
+                f'<a href="{url}" target="_blank" rel="noopener" style="color:#8A6D00;font-weight:700;display:block;flex:1">'
+                f'★ {domain} — это мы{subtitle}</a></div>')
+    return (f'<div class="donor" style="align-items:flex-start">'
+            f'<img src="{favicon(domain)}" width="16" height="16" style="margin-top:2px;border-radius:3px;flex-shrink:0">'
+            f'<a href="{url}" target="_blank" rel="noopener" style="display:block;flex:1">'
+            f'{domain}{subtitle}</a>'
+            f'<span class="stype">{CH_LAB.get(source_type, source_type)}</span></div>')
+
+@st.cache_data(ttl=600)
+def _rows(sql: str, params=()):
+    with psycopg2.connect(DATABASE_URL) as conn, \
+         conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+def weeks():
+    return [r["week_start"] for r in _rows(
+        "SELECT DISTINCT week_start FROM aeo.mentions ORDER BY week_start")]
+
+def providers_in_week(week):
+    return [r["provider"] for r in _rows(
+        "SELECT DISTINCT provider FROM aeo.mentions WHERE week_start=%s ORDER BY provider", (week,))]
+
+def _prov_clause(provider):
+    return ("AND provider=%s", (provider,)) if provider else ("", ())
+
+def sov_by_brand(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT brand, bool_or(is_ours) AS is_ours,
+        round(100.0*sum(mentioned::int)/count(*),1) AS sov,
+        round(avg(first_position) FILTER (WHERE mentioned),1) AS avg_pos
+        FROM aeo.mentions WHERE week_start=%s {pc} GROUP BY brand ORDER BY sov DESC""", (week, *pp))
+
+def sov_by_brand_provider(week):
+    return {(r["brand"], r["provider"]): float(r["sov"]) for r in _rows(
+        """SELECT brand, provider, round(100.0*sum(mentioned::int)/count(*),0) AS sov
+           FROM aeo.mentions WHERE week_start=%s GROUP BY brand, provider""", (week,))}
+
+def sov_trend(provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT week_start, brand,
+        round(100.0*sum(mentioned::int)/count(*),1) AS sov
+        FROM aeo.mentions WHERE true {pc} GROUP BY week_start, brand ORDER BY week_start""", pp)
+
+def channel_shares(week, provider=None):
+    pc, pp = _prov_clause(provider)
+    return _rows(f"""SELECT source_type, count(*) AS n,
         round(100.0*count(*)/sum(count(*)) OVER (),0) AS pct
         FROM aeo.citations WHERE week_start=%s {pc} GROUP BY source_type ORDER BY n DESC""", (week, *pp))
 
@@ -289,6 +491,24 @@ def save_audit(url, score, content_json, content_hash):
             (url, score, content_json, content_hash))
         conn.commit()
     _rows.clear()
+
+def crawler_score_row(url):
+    r = _rows("""SELECT page_status, score, bots_ok, bots_blocked, bots_unknown,
+        html_bytes, text_bytes, content_ratio_pct, jsonld_blocks, summary, checked_at
+        FROM aeo.crawler_scores WHERE url=%s""", (url,))
+    return r[0] if r else None
+
+def crawler_bots_rows(url):
+    return _rows("""SELECT bot, category, verdict, is_critical, blocked_by, detail, content_delta_pct
+        FROM aeo.crawler_access WHERE url=%s
+        ORDER BY category, is_critical DESC, bot""", (url,))
+
+def run_crawler_check_live(url):
+    report = crawler_check.check_url(url)
+    with psycopg2.connect(DATABASE_URL) as conn:
+        crawler_check.save_report(conn, report)
+    _rows.clear()
+    return report
 
 def list_experiments():
     return _rows("SELECT id, started_at, description, query_id, url FROM aeo.experiments ORDER BY started_at DESC")
@@ -809,6 +1029,237 @@ with right:
     st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
 
 st.write("")
+cands = brand_candidates(week)
+if cands:
+    rows = "".join(
+        f'<div class="al"><span class="badge b-amb">NEW</span>'
+        f'<p><b>{c["brand"]}</b> — упомянут {c["mention_count"]}× в ответах этой недели, '
+        f'не в списке отслеживаемых брендов</p></div>'
+        for c in cands)
+    st.markdown(f'<div class="card"><h2 class="sec">AI заметил новые бренды ({len(cands)})</h2>{rows}'
+        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Если это реальный конкурент — добавь его '
+        f'в queries.yaml → competitors, и со следующей недели он появится в общей таблице</p></div>',
+        unsafe_allow_html=True)
+
+st.write("")
+
+mentions_detail = our_mentions_detail(week, provider)
+st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся — {choice} ({len(mentions_detail)} случаев)</h2>'
+            f'<p style="font-size:12.5px;color:#98A2B5;margin:0">Открой запрос — увидишь источники и текст ответа '
+            f'с подсветкой каждого упоминания {NICHE}</p></div>', unsafe_allow_html=True)
+if mentions_detail:
+    for m in mentions_detail:
+        label = (f'{P_SHORT.get(m["provider"], m["provider"].upper())} · позиция {m["first_position"]} · '
+                 f'{m["query_id"]} — {m["query_text"][:70]}')
+        with st.expander(label):
+            cits = citations_for(week, m["query_id"], m["provider"])
+            if cits:
+                cits_sorted = sorted(cits, key=lambda c: not c["is_ours"])
+                links = "".join(
+                    source_row(c["domain"], c["url"], c["source_type"], c["is_ours"],
+                               c.get("title"), mine=c["is_ours"])
+                    for c in cits_sorted)
+                st.markdown(f'<div class="lab">Источники этого ответа ({len(cits)})</div>{links}',
+                            unsafe_allow_html=True)
+            else:
+                st.caption("Источники не зафиксированы для этого запроса")
+            st.markdown(f'<div style="margin-top:10px"><span class="mtag">{m["mention_count"]}× упоминаний нас в тексте</span></div>',
+                        unsafe_allow_html=True)
+            st.markdown("**Текст ответа с подсветкой упоминаний:**")
+            st.markdown(highlight_brand(m["response_text"], ALIASES), unsafe_allow_html=True)
+else:
+    st.info("В этом срезе ни один движок нас не упомянул ни разу.")
+
+st.write("")
+qm = our_query_matrix(week, provider)
+if qm:
+    grid = defaultdict(dict)
+    qtexts = {}
+    for r in qm:
+        grid[r["query_id"]][r["provider"]] = r["mentioned"]
+        qtexts[r["query_id"]] = r["query_text"]
+    rows_sorted = sorted(grid.items(), key=lambda kv: sum(kv[1].values()))
+    head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in provs)
+    body = ""
+    for qid, per in rows_sorted:
+        total = sum(per.values())
+        cells = "".join(
+            f'<td class="n" style="color:{"#12946A" if per.get(p) else "#D6452C"}">{"✓" if per.get(p) else "✗"}</td>'
+            for p in provs)
+        row_style = ' style="background:#FBE9E4"' if total == 0 else ""
+        body += (f'<tr{row_style}><td class="n">{qid}</td>'
+                 f'<td>{qtexts[qid][:70]}</td>{cells}</tr>')
+    st.markdown(f'<div class="card"><h2 class="sec">Где нас нет — {choice}</h2>'
+        f'<table class="aeo"><tr><th>ID</th><th>Запрос</th>{head}</tr>{body}</table>'
+        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном из выбранных движков</p></div>', unsafe_allow_html=True)
+
+CATEGORY_LABELS = {"search": "Search — формируют ответ", "agent": "Agent — по поручению пользователя",
+                   "training": "Training — корпус для обучения"}
+VERDICT_COLOR = {"ok": ("#E1F5EC", "#12946A"), "blocked": ("#FBE9E4", "#D6452C"),
+                  "unknown": ("#FBF1DC", "#C07E14"), "skipped": ("#EEF1F6", "#98A2B5")}
+
+def render_crawler_card(url, label):
+    score_row = crawler_score_row(url)
+    bots = crawler_bots_rows(url)
+    if not score_row:
+        st.caption(f"{label}: ещё не проверялся — нажми «Проверить»")
+        return
+    score = score_row["score"]
+    if score is None:
+        st.markdown(f'<div class="card"><h2 class="sec">{label}</h2>'
+                    f'<p style="font-size:13px;color:#D6452C">{score_row["summary"]}</p></div>', unsafe_allow_html=True)
+        return
+    score_color = "#12946A" if score >= 70 else "#C07E14" if score >= 40 else "#D6452C"
+    groups_html = ""
+    for cat in ("search", "agent", "training"):
+        group = [b for b in bots if b["category"] == cat]
+        if not group:
+            continue
+        rows_html = "".join(
+            (lambda bg, fg: f'<div class="crow"><span class="nm" style="width:150px">{b["bot"]}{" ★" if b["is_critical"] else ""}</span>'
+             f'<span class="badge" style="background:{bg};color:{fg};margin-right:8px">{b["verdict"]}</span>'
+             f'<span style="flex:1;font-size:11.5px;color:#98A2B5">{b["detail"]}</span></div>')(*VERDICT_COLOR.get(b["verdict"], ("#EEF1F6","#5B6577")))
+            for b in group)
+        groups_html += f'<div class="lab" style="margin-top:10px">{CATEGORY_LABELS[cat]}</div>{rows_html}'
+    st.markdown(
+        f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
+        f'<h2 class="sec" style="margin:0">{label}</h2>'
+        f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
+        f'<p style="font-size:13px;color:#1A2233;margin-top:8px">{score_row["summary"]}</p>'
+        f'{groups_html}</div>', unsafe_allow_html=True)
+
+
+st.write("")
+# ── Доступность для AI-краулеров: свой сайт + опционально чужой ──
+with st.expander("🕷️ Доступность для AI-краулеров (до проверки разметки)"):
+    if not HAS_CRAWLER_CHECK:
+        st.caption("Файл crawler_check.py не найден в репо — положи его в корень рядом со streamlit_app.py")
+    else:
+        default_own = NICHE if NICHE.startswith("http") else f"https://{NICHE}"
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            own_url = st.text_input("Наш сайт", value=default_own, key="own_crawler_url")
+            if st.button("🕷️ Проверить наш сайт", key="check_own"):
+                with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
+                    try:
+                        run_crawler_check_live(own_url)
+                    except Exception as e:
+                        st.error(f"Ошибка: {e}")
+            render_crawler_card(own_url, "Наш сайт")
+        with cc2:
+            other_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_crawler_url")
+            if st.button("🕷️ Проверить чужой сайт", key="check_other", disabled=not other_url):
+                with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
+                    try:
+                        run_crawler_check_live(other_url)
+                    except Exception as e:
+                        st.error(f"Ошибка: {e}")
+            if other_url:
+                render_crawler_card(other_url, "Чужой сайт")
+            else:
+                st.caption("Введи URL конкурента, чтобы сравнить доступность бок о бок")
+
+st.write("")
+# ── Agent Readiness: аудит страницы сайта ──
+with st.expander("🔍 Аудит сайта — Agent Readiness"):
+    audit_url = st.text_input("URL страницы для проверки", placeholder="https://merino.tech/products/base-layer")
+    audit_col1, audit_col2 = st.columns([3, 2])
+    cached_audit = get_cached_audit(audit_url) if audit_url else None
+    with audit_col2:
+        audit_clicked = st.button(
+            "🔍 Обновить аудит" if cached_audit else "🔍 Запустить аудит",
+            use_container_width=True, disabled=not audit_url)
+    if audit_clicked and audit_url:
+        if not ANTHROPIC_API_KEY:
+            st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
+        else:
+            with st.spinner("Скачиваю страницу и анализирую..."):
+                try:
+                    catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
+                    content_json, score, chash = run_site_audit(audit_url, catalog_facts)
+                    save_audit(audit_url, score, content_json, chash)
+                    cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
+                except Exception as e:
+                    st.error(f"Ошибка аудита: {e}")
+                    cached_audit = None
+    if cached_audit:
+        import json as _json2
+        try:
+            adata = _json2.loads(cached_audit["content"])
+            score = cached_audit["score"] or 0
+            score_color = "#12946A" if score >= 70 else "#C07E14" if score >= 40 else "#D6452C"
+            findings_html = "".join(
+                f'<div class="al"><span class="badge" style="background:'
+                f'{"#E1F5EC" if f["status"]=="ok" else "#FBF1DC" if f["status"]=="mismatch" else "#FBE9E4"};'
+                f'color:{"#12946A" if f["status"]=="ok" else "#C07E14" if f["status"]=="mismatch" else "#D6452C"}">'
+                f'{f["status"]}</span><p><b>{f["check"]}</b><br>{f["detail"]}</p></div>'
+                for f in adata.get("findings", []))
+            recs_html = "".join(f'<li style="font-size:13px;color:#1A2233;margin-bottom:4px">{r}</li>'
+                                for r in adata.get("recommendations", []))
+            st.markdown(
+                f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h2 class="sec" style="margin:0">Agent readiness score</h2>'
+                f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
+                f'<div style="margin-top:10px">{findings_html}</div>'
+                f'<div class="lab" style="margin-top:12px">Что делать</div>'
+                f'<ul style="margin:4px 0 0;padding-left:18px">{recs_html}</ul></div>',
+                unsafe_allow_html=True)
+        except Exception:
+            st.caption("Не удалось разобрать сохранённый результат — запусти аудит заново")
+    else:
+        st.caption("Введи URL и нажми «Запустить аудит»")
+
+st.write("")
+# ── Rung 2: Фактчек бренда ──
+fc = factcheck_flags(week)
+mismatches = [f for f in fc if f["mismatch"]]
+if fc:
+    if mismatches:
+        rows_html = "".join(
+            f'<div class="al"><span class="badge b-red">{f["query_id"]}·{P_SHORT.get(f["provider"], f["provider"].upper())}</span>'
+            f'<p><b>AI утверждает:</b> {f["claim"]}<br><b>На самом деле:</b> {f["fact"]}</p></div>'
+            for f in mismatches)
+        st.markdown(f'<div class="card"><h2 class="sec">✓ Фактчек бренда — найдено расхождений: {len(mismatches)}</h2>{rows_html}</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><h2 class="sec">✓ Фактчек бренда</h2>'
+                     '<p style="font-size:13px;color:#12946A">Расхождений с каталогом не найдено на этой неделе.</p></div>',
+                     unsafe_allow_html=True)
+else:
+    st.caption("Фактчек ещё не запускался для этой недели (нужен catalog_facts в queries.yaml)")
+
+st.write("")
+# ── Rung 3: AI-трафик → заказы (ручной ввод до подключения Shopify/GA4 API) ──
+with st.expander("📈 AI-трафик → заказы (Demand — мост к деньгам)"):
+    existing = ai_traffic_row(week)
+    with st.form("ai_traffic_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sessions_in = st.number_input("Сессии с AI-рефереров (chatgpt.com, perplexity.ai, ...)",
+                min_value=0, value=int(existing["ai_sessions"]) if existing and existing["ai_sessions"] else 0)
+        with c2:
+            orders_in = st.number_input("Заказы из этих сессий",
+                min_value=0, value=int(existing["ai_orders"]) if existing and existing["ai_orders"] else 0)
+        with c3:
+            revenue_in = st.number_input("Выручка ($)",
+                min_value=0.0, value=float(existing["ai_revenue"]) if existing and existing["ai_revenue"] else 0.0, step=10.0)
+        note_in = st.text_input("Заметка (опционально)", value=existing["note"] if existing and existing.get("note") else "")
+        if st.form_submit_button("Сохранить данные недели"):
+            save_ai_traffic(week, int(sessions_in), int(orders_in), float(revenue_in), note_in.strip() or None)
+            st.success("Сохранено")
+
+    trend = ai_traffic_trend()
+    if len(trend) >= 2:
+        rows_html = "".join(
+            f'<div class="crow"><span class="nm">{r["week_start"]}</span>'
+            f'<span style="flex:1;font-family:\'IBM Plex Mono\',monospace;font-size:12px;color:#5B6577">'
+            f'{r["ai_sessions"] or 0} сессий · {r["ai_orders"] or 0} заказов · ${r["ai_revenue"] or 0:.0f}</span></div>'
+            for r in trend)
+        st.markdown(f'<div class="lab" style="margin-top:10px">История</div>{rows_html}', unsafe_allow_html=True)
+    else:
+        st.caption("Заполни хотя бы 2 недели, чтобы увидеть тренд AI-трафика рядом с трендом SOV")
+
+st.write("")
 if not AI_MODELS:
     st.caption("Добавь ANTHROPIC_API_KEY или GEMINI_API_KEY/VERTEX_SA_JSON_B64 в Secrets, чтобы включить AI-разбор")
 else:
@@ -911,171 +1362,6 @@ with st.expander("⚗ Эксперименты — гипотеза → дейс
     else:
         st.caption("Пока нет ни одного зафиксированного эксперимента")
 
-st.write("")
-# ── Rung 2: Фактчек бренда ──
-fc = factcheck_flags(week)
-mismatches = [f for f in fc if f["mismatch"]]
-if fc:
-    if mismatches:
-        rows_html = "".join(
-            f'<div class="al"><span class="badge b-red">{f["query_id"]}·{P_SHORT.get(f["provider"], f["provider"].upper())}</span>'
-            f'<p><b>AI утверждает:</b> {f["claim"]}<br><b>На самом деле:</b> {f["fact"]}</p></div>'
-            for f in mismatches)
-        st.markdown(f'<div class="card"><h2 class="sec">✓ Фактчек бренда — найдено расхождений: {len(mismatches)}</h2>{rows_html}</div>',
-                    unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="card"><h2 class="sec">✓ Фактчек бренда</h2>'
-                     '<p style="font-size:13px;color:#12946A">Расхождений с каталогом не найдено на этой неделе.</p></div>',
-                     unsafe_allow_html=True)
-else:
-    st.caption("Фактчек ещё не запускался для этой недели (нужен catalog_facts в queries.yaml)")
-
-st.write("")
-# ── Rung 3: AI-трафик → заказы (ручной ввод до подключения Shopify/GA4 API) ──
-with st.expander("📈 AI-трафик → заказы (Demand — мост к деньгам)"):
-    existing = ai_traffic_row(week)
-    with st.form("ai_traffic_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            sessions_in = st.number_input("Сессии с AI-рефереров (chatgpt.com, perplexity.ai, ...)",
-                min_value=0, value=int(existing["ai_sessions"]) if existing and existing["ai_sessions"] else 0)
-        with c2:
-            orders_in = st.number_input("Заказы из этих сессий",
-                min_value=0, value=int(existing["ai_orders"]) if existing and existing["ai_orders"] else 0)
-        with c3:
-            revenue_in = st.number_input("Выручка ($)",
-                min_value=0.0, value=float(existing["ai_revenue"]) if existing and existing["ai_revenue"] else 0.0, step=10.0)
-        note_in = st.text_input("Заметка (опционально)", value=existing["note"] if existing and existing.get("note") else "")
-        if st.form_submit_button("Сохранить данные недели"):
-            save_ai_traffic(week, int(sessions_in), int(orders_in), float(revenue_in), note_in.strip() or None)
-            st.success("Сохранено")
-
-    trend = ai_traffic_trend()
-    if len(trend) >= 2:
-        rows_html = "".join(
-            f'<div class="crow"><span class="nm">{r["week_start"]}</span>'
-            f'<span style="flex:1;font-family:\'IBM Plex Mono\',monospace;font-size:12px;color:#5B6577">'
-            f'{r["ai_sessions"] or 0} сессий · {r["ai_orders"] or 0} заказов · ${r["ai_revenue"] or 0:.0f}</span></div>'
-            for r in trend)
-        st.markdown(f'<div class="lab" style="margin-top:10px">История</div>{rows_html}', unsafe_allow_html=True)
-    else:
-        st.caption("Заполни хотя бы 2 недели, чтобы увидеть тренд AI-трафика рядом с трендом SOV")
-
-st.write("")
-# ── Agent Readiness: аудит страницы сайта ──
-with st.expander("🔍 Аудит сайта — Agent Readiness"):
-    audit_url = st.text_input("URL страницы для проверки", placeholder="https://merino.tech/products/base-layer")
-    audit_col1, audit_col2 = st.columns([3, 2])
-    cached_audit = get_cached_audit(audit_url) if audit_url else None
-    with audit_col2:
-        audit_clicked = st.button(
-            "🔍 Обновить аудит" if cached_audit else "🔍 Запустить аудит",
-            use_container_width=True, disabled=not audit_url)
-    if audit_clicked and audit_url:
-        if not ANTHROPIC_API_KEY:
-            st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
-        else:
-            with st.spinner("Скачиваю страницу и анализирую..."):
-                try:
-                    catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
-                    content_json, score, chash = run_site_audit(audit_url, catalog_facts)
-                    save_audit(audit_url, score, content_json, chash)
-                    cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
-                except Exception as e:
-                    st.error(f"Ошибка аудита: {e}")
-                    cached_audit = None
-    if cached_audit:
-        import json as _json2
-        try:
-            adata = _json2.loads(cached_audit["content"])
-            score = cached_audit["score"] or 0
-            score_color = "#12946A" if score >= 70 else "#C07E14" if score >= 40 else "#D6452C"
-            findings_html = "".join(
-                f'<div class="al"><span class="badge" style="background:'
-                f'{"#E1F5EC" if f["status"]=="ok" else "#FBF1DC" if f["status"]=="mismatch" else "#FBE9E4"};'
-                f'color:{"#12946A" if f["status"]=="ok" else "#C07E14" if f["status"]=="mismatch" else "#D6452C"}">'
-                f'{f["status"]}</span><p><b>{f["check"]}</b><br>{f["detail"]}</p></div>'
-                for f in adata.get("findings", []))
-            recs_html = "".join(f'<li style="font-size:13px;color:#1A2233;margin-bottom:4px">{r}</li>'
-                                for r in adata.get("recommendations", []))
-            st.markdown(
-                f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h2 class="sec" style="margin:0">Agent readiness score</h2>'
-                f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
-                f'<div style="margin-top:10px">{findings_html}</div>'
-                f'<div class="lab" style="margin-top:12px">Что делать</div>'
-                f'<ul style="margin:4px 0 0;padding-left:18px">{recs_html}</ul></div>',
-                unsafe_allow_html=True)
-        except Exception:
-            st.caption("Не удалось разобрать сохранённый результат — запусти аудит заново")
-    else:
-        st.caption("Введи URL и нажми «Запустить аудит»")
-
-st.write("")
-cands = brand_candidates(week)
-if cands:
-    rows = "".join(
-        f'<div class="al"><span class="badge b-amb">NEW</span>'
-        f'<p><b>{c["brand"]}</b> — упомянут {c["mention_count"]}× в ответах этой недели, '
-        f'не в списке отслеживаемых брендов</p></div>'
-        for c in cands)
-    st.markdown(f'<div class="card"><h2 class="sec">AI заметил новые бренды ({len(cands)})</h2>{rows}'
-        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Если это реальный конкурент — добавь его '
-        f'в queries.yaml → competitors, и со следующей недели он появится в общей таблице</p></div>',
-        unsafe_allow_html=True)
-
-st.write("")
-
-mentions_detail = our_mentions_detail(week, provider)
-st.markdown(f'<div class="card"><h2 class="sec">Где мы упоминаемся — {choice} ({len(mentions_detail)} случаев)</h2>'
-            f'<p style="font-size:12.5px;color:#98A2B5;margin:0">Открой запрос — увидишь источники и текст ответа '
-            f'с подсветкой каждого упоминания {NICHE}</p></div>', unsafe_allow_html=True)
-if mentions_detail:
-    for m in mentions_detail:
-        label = (f'{P_SHORT.get(m["provider"], m["provider"].upper())} · позиция {m["first_position"]} · '
-                 f'{m["query_id"]} — {m["query_text"][:70]}')
-        with st.expander(label):
-            cits = citations_for(week, m["query_id"], m["provider"])
-            if cits:
-                cits_sorted = sorted(cits, key=lambda c: not c["is_ours"])
-                links = "".join(
-                    source_row(c["domain"], c["url"], c["source_type"], c["is_ours"],
-                               c.get("title"), mine=c["is_ours"])
-                    for c in cits_sorted)
-                st.markdown(f'<div class="lab">Источники этого ответа ({len(cits)})</div>{links}',
-                            unsafe_allow_html=True)
-            else:
-                st.caption("Источники не зафиксированы для этого запроса")
-            st.markdown(f'<div style="margin-top:10px"><span class="mtag">{m["mention_count"]}× упоминаний нас в тексте</span></div>',
-                        unsafe_allow_html=True)
-            st.markdown("**Текст ответа с подсветкой упоминаний:**")
-            st.markdown(highlight_brand(m["response_text"], ALIASES), unsafe_allow_html=True)
-else:
-    st.info("В этом срезе ни один движок нас не упомянул ни разу.")
-
-st.write("")
-qm = our_query_matrix(week, provider)
-if qm:
-    grid = defaultdict(dict)
-    qtexts = {}
-    for r in qm:
-        grid[r["query_id"]][r["provider"]] = r["mentioned"]
-        qtexts[r["query_id"]] = r["query_text"]
-    rows_sorted = sorted(grid.items(), key=lambda kv: sum(kv[1].values()))
-    head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in provs)
-    body = ""
-    for qid, per in rows_sorted:
-        total = sum(per.values())
-        cells = "".join(
-            f'<td class="n" style="color:{"#12946A" if per.get(p) else "#D6452C"}">{"✓" if per.get(p) else "✗"}</td>'
-            for p in provs)
-        row_style = ' style="background:#FBE9E4"' if total == 0 else ""
-        body += (f'<tr{row_style}><td class="n">{qid}</td>'
-                 f'<td>{qtexts[qid][:70]}</td>{cells}</tr>')
-    st.markdown(f'<div class="card"><h2 class="sec">Где нас нет — {choice}</h2>'
-        f'<table class="aeo"><tr><th>ID</th><th>Запрос</th>{head}</tr>{body}</table>'
-        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном из выбранных движков</p></div>', unsafe_allow_html=True)
-
 with st.expander("Сырые ответы AI"):
     resp = all_responses(week, provider)
     qids = sorted({r["query_id"] for r in resp})
@@ -1085,4 +1371,4 @@ with st.expander("Сырые ответы AI"):
             if r["query_id"] == sel:
                 st.markdown(f'**{r["provider"]}** — {r["query_text"][:90]}')
                 st.markdown(highlight_brand(r["response_text"], ALIASES), unsafe_allow_html=True)
-                st.divider() 
+                st.divider()
