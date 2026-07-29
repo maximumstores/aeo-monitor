@@ -6,202 +6,6 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-import psycopg2
-import psycopg2.extras
-import streamlit as st
-
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if not DATABASE_URL:
-    try:
-        DATABASE_URL = st.secrets["DATABASE_URL"]
-    except Exception:
-        pass
-
-st.set_page_config(page_title="AEO Radar", page_icon="◎", layout="wide")
-
-if not DATABASE_URL:
-    st.error("DATABASE_URL не найден в Secrets")
-    st.stop()
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-if not ANTHROPIC_API_KEY:
-    try:
-        ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        pass
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-VERTEX_SA_JSON_B64 = os.getenv("VERTEX_SA_JSON_B64", "")
-VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "")
-VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
-for _k in ("GEMINI_API_KEY", "VERTEX_SA_JSON_B64", "VERTEX_PROJECT", "VERTEX_LOCATION"):
-    if not globals()[_k]:
-        try:
-            globals()[_k] = st.secrets[_k]
-        except Exception:
-            pass
-
-DDL = """
-CREATE SCHEMA IF NOT EXISTS aeo;
-CREATE TABLE IF NOT EXISTS aeo.responses (
-    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
-    query_text text NOT NULL, response_text text,
-    fetched_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (week_start, query_id, provider));
-CREATE TABLE IF NOT EXISTS aeo.mentions (
-    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
-    brand text NOT NULL, is_ours boolean NOT NULL DEFAULT false,
-    mentioned boolean NOT NULL DEFAULT false, first_position int,
-    mention_count int NOT NULL DEFAULT 0,
-    PRIMARY KEY (week_start, query_id, provider, brand));
-CREATE TABLE IF NOT EXISTS aeo.citations (
-    week_start date NOT NULL, query_id text NOT NULL, provider text NOT NULL,
-    url text NOT NULL, domain text NOT NULL, position int,
-    is_ours boolean NOT NULL DEFAULT false,
-    source_type text NOT NULL DEFAULT 'third_party', title text,
-    fetched_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (week_start, query_id, provider, url));
-CREATE TABLE IF NOT EXISTS aeo.brand_candidates (
-    week_start date NOT NULL,
-    brand text NOT NULL,
-    mention_count int NOT NULL DEFAULT 1,
-    status text NOT NULL DEFAULT 'new',
-    PRIMARY KEY (week_start, brand));
-CREATE TABLE IF NOT EXISTS aeo.experiments (
-    id serial PRIMARY KEY,
-    started_at date NOT NULL DEFAULT current_date,
-    description text NOT NULL,
-    query_id text,
-    url text,
-    created_at timestamptz NOT NULL DEFAULT now());
-ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS problem text;
-ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS hypothesis text;
-ALTER TABLE aeo.experiments ADD COLUMN IF NOT EXISTS baseline_sov numeric;
-CREATE TABLE IF NOT EXISTS aeo.ai_insights (
-    week_start date NOT NULL,
-    provider text NOT NULL DEFAULT 'all',
-    content text NOT NULL,
-    generated_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (week_start, provider));
-ALTER TABLE aeo.ai_insights ADD COLUMN IF NOT EXISTS data_hash text;
-
-CREATE TABLE IF NOT EXISTS aeo.factcheck_flags (
-    week_start date NOT NULL,
-    query_id text NOT NULL,
-    provider text NOT NULL,
-    claim text NOT NULL,
-    fact text NOT NULL,
-    mismatch boolean NOT NULL DEFAULT true,
-    created_at timestamptz NOT NULL DEFAULT now());
-
-CREATE TABLE IF NOT EXISTS aeo.ai_traffic (
-    week_start date NOT NULL PRIMARY KEY,
-    ai_sessions int,
-    ai_orders int,
-    ai_revenue numeric,
-    note text,
-    updated_at timestamptz NOT NULL DEFAULT now());
-
-CREATE TABLE IF NOT EXISTS aeo.site_audits (
-    url text NOT NULL PRIMARY KEY,
-    score int,
-    content text NOT NULL,
-    content_hash text NOT NULL,
-    generated_at timestamptz NOT NULL DEFAULT now());
-"""
-with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
-    _cur.execute(DDL)
-    _c.commit()
-
-NICHE, N_QUERIES = "merino.tech", 16
-ALIASES = [NICHE]
-try:
-    import yaml
-    _cfg = yaml.safe_load(Path("queries.yaml").read_text(encoding="utf-8"))
-    NICHE = (_cfg.get("brands", {}).get("ours") or [NICHE])[0]
-    N_QUERIES = len(_cfg.get("queries", [])) or N_QUERIES
-    ALIASES = _cfg.get("aliases", {}).get(NICHE, [NICHE]) or [NICHE]
-except Exception:
-    pass
-
-def highlight_brand(text, aliases):
-    if not text or not aliases:
-        return text
-    pattern = "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
-    return re.sub(
-        f"({pattern})",
-        r'<mark style="background:#FFE58A;color:#1A2233;padding:1px 3px;'
-        r'border-radius:3px;font-weight:700">\1</mark>',
-        text, flags=re.IGNORECASE,
-    )
-
-def favicon(domain):
-    return f'https://www.google.com/s2/favicons?domain={domain}&sz=32'
-
-
-def source_row(domain, url, source_type, is_ours, title=None, mine=False):
-    """Единая карточка источника: favicon + домен-ссылка + заголовок + тип."""
-    t = (title or "")[:80]
-    subtitle = f'<div style="font-size:11px;color:{"#8A6D00" if mine else "#98A2B5"};font-weight:400;white-space:normal;line-height:1.3;margin-top:1px">{t}</div>' if t else ""
-    if mine:
-        return (f'<div class="donor" style="background:#FFF6D9;border-radius:6px;padding:7px 9px;margin:3px 0;'
-                f'border:1px solid #FFE58A;align-items:flex-start">'
-                f'<img src="{favicon(domain)}" width="16" height="16" style="margin-top:2px;border-radius:3px;flex-shrink:0">'
-                f'<a href="{url}" target="_blank" rel="noopener" style="color:#8A6D00;font-weight:700;display:block;flex:1">'
-                f'★ {domain} — это мы{subtitle}</a></div>')
-    return (f'<div class="donor" style="align-items:flex-start">'
-            f'<img src="{favicon(domain)}" width="16" height="16" style="margin-top:2px;border-radius:3px;flex-shrink:0">'
-            f'<a href="{url}" target="_blank" rel="noopener" style="display:block;flex:1">'
-            f'{domain}{subtitle}</a>'
-            f'<span class="stype">{CH_LAB.get(source_type, source_type)}</span></div>')
-
-@st.cache_data(ttl=600)
-def _rows(sql: str, params=()):
-    with psycopg2.connect(DATABASE_URL) as conn, \
-         conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, params)
-        return [dict(r) for r in cur.fetchall()]
-
-def weeks():
-    return [r["week_start"] for r in _rows(
-        "SELECT DISTINCT week_start FROM aeo.mentions ORDER BY week_start")]
-
-def providers_in_week(week):
-    return [r["provider"] for r in _rows(
-        "SELECT DISTINCT provider FROM aeo.mentions WHERE week_start=%s ORDER BY provider", (week,))]
-
-def _prov_clause(provider):
-    return ("AND provider=%s", (provider,)) if provider else ("", ())
-
-def sov_by_brand(week, provider=None):
-    pc, pp = _prov_clause(provider)
-    return _rows(f"""SELECT brand, bool_or(is_ours) AS is_ours,
-        round(100.0*sum(mentioned::int)/count(*),1) AS sov,
-        round(avg(first_position) FILTER (WHERE mentioned),1) AS avg_pos
-        FROM aeo.mentions WHERE week_start=%s {pc} GROUP BY brand ORDER BY sov DESC""", (week, *pp))
-
-def sov_by_brand_provider(week):
-    return {(r["brand"], r["provider"]): float(r["sov"]) for r in _rows(
-        """SELECT brand, provider, round(100.0*sum(mentioned::int)/count(*),0) AS sov
-           FROM aeo.mentions WHERE week_start=%s GROUP BY brand, provider""", (week,))}
-
-def sov_trend(provider=None):
-    pc, pp = _prov_clause(provider)
-    return _rows(f"""SELECT week_start, brand,
-        round(100.0*sum(mentioned::int)/count(*),1) AS sov
-        FROM aeo.mentions WHERE true {pc} GROUP BY week_start, brand ORDER BY week_start""", pp)
-
-def channel_shares(week, provider=None):
-    pc, pp = _prov_clause(provider)
-    return _rows(f"""SELECT source_type, count(*) AS n,
-        round(100.0*count(*)/sum(count(*)) OVER (),0) AS pct# -*- coding: utf-8 -*-
-"""AEO Radar — дашборд, всё в одном файле. Секрет: DATABASE_URL."""
-import hashlib
-import os
-import re
-from collections import defaultdict
-from pathlib import Path
-
 try:
     import crawler_check
     HAS_CRAWLER_CHECK = True
@@ -855,7 +659,7 @@ st.markdown("""<style>
 .aeo-logo{font-family:Manrope;font-weight:800;font-size:22px;color:#1A2233}
 .aeo-logo span{color:#3D5AFE}
 .aeo-meta{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#98A2B5;text-transform:uppercase;margin-top:2px}
-.card{background:#FFF;border:1px solid #E4E8F0;border-radius:16px;padding:18px}
+.card{background:#FFF;border:1px solid #E4E8F0;border-radius:16px;padding:18px;height:100%}
 .lab{font-size:12px;color:#98A2B5;font-weight:500;margin-bottom:6px}
 .big{font-family:Manrope;font-weight:800;font-size:29px;color:#1A2233;letter-spacing:-.02em}
 .delta{display:inline-block;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;border-radius:999px;padding:2px 9px;margin-top:8px}
@@ -1018,7 +822,10 @@ with left:
         f'<table class="aeo"><tr><th>Бренд</th><th class="n">SOV</th><th class="n">Δ</th>'
         f'<th class="n">поз.</th>{head}</tr>{body}</table></div>', unsafe_allow_html=True)
 with right:
-    alerts = [{"sev":"HI","text":f'Выпала наша цитата: {r["url"]}'} for r in (lost_own_urls(week, prev, provider) if prev else [])]
+    def _short_url(u, maxlen=70):
+        base = u.split("?")[0]
+        return base if len(base) <= maxlen else base[:maxlen] + "…"
+    alerts = [{"sev":"HI","text":f'Выпала наша цитата: <a href="{r["url"]}" target="_blank" rel="noopener">{_short_url(r["url"])}</a>'} for r in (lost_own_urls(week, prev, provider) if prev else [])]
     alerts += [{"sev":"MD","text":f'{b["brand"]} +{b["delta"]} п.п. за неделю'}
                for b in brands if not b["is_ours"] and b["delta"] and b["delta"] >= 5]
     dc = delta(own_c, own_c_prev)
