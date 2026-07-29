@@ -114,6 +114,13 @@ CREATE TABLE IF NOT EXISTS aeo.site_audits (
     content text NOT NULL,
     content_hash text NOT NULL,
     generated_at timestamptz NOT NULL DEFAULT now());
+
+CREATE TABLE IF NOT EXISTS aeo.site_score_history (
+    checked_at date NOT NULL DEFAULT current_date,
+    url text NOT NULL,
+    crawler_score int,
+    audit_score int,
+    PRIMARY KEY (checked_at, url));
 """
 with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
@@ -295,6 +302,24 @@ def save_audit(url, score, content_json, content_hash):
             (url, score, content_json, content_hash))
         conn.commit()
     _rows.clear()
+
+def log_site_score(url, crawler_score=None, audit_score=None):
+    """Пишет сегодняшнюю оценку в историю нашего сайта. Если сегодня уже была
+    запись с другим чеком — не затирает его COALESCE'ом."""
+    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute("""INSERT INTO aeo.site_score_history (checked_at, url, crawler_score, audit_score)
+            VALUES (current_date, %s, %s, %s)
+            ON CONFLICT (checked_at, url) DO UPDATE SET
+              crawler_score = COALESCE(EXCLUDED.crawler_score, aeo.site_score_history.crawler_score),
+              audit_score   = COALESCE(EXCLUDED.audit_score, aeo.site_score_history.audit_score)""",
+            (url, crawler_score, audit_score))
+        conn.commit()
+    _rows.clear()
+
+def site_score_trend(url, limit=12):
+    return _rows("""SELECT checked_at, crawler_score, audit_score
+        FROM aeo.site_score_history WHERE url=%s
+        ORDER BY checked_at DESC LIMIT %s""", (url, limit))[::-1]
 
 def crawler_score_row(url):
     r = _rows("""SELECT page_status, score, bots_ok, bots_blocked, bots_unknown,
@@ -957,6 +982,42 @@ def render_crawler_card(url, label):
 
 
 st.write("")
+# ── Модуль отслеживания нашего сайта: история готовности во времени ──
+_own_domain_for_history = NICHE if NICHE.startswith("http") else f"https://{NICHE}"
+_hist = site_score_trend(_own_domain_for_history)
+if _hist:
+    W, H, X, Y = 560, 100, 30, 15
+    step = W / max(len(_hist) - 1, 1)
+    def _line(key, color):
+        pts = []
+        for i, r in enumerate(_hist):
+            v = r.get(key)
+            if v is None:
+                continue
+            pts.append(f"{X+i*step:.0f},{Y+H-(v/100)*H:.0f}")
+        if len(pts) < 2:
+            return ""
+        return f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round"/>'
+    lines_html = _line("crawler_score", "#3D5AFE") + _line("audit_score", "#12946A")
+    labels_html = "".join(f'<text x="{X+i*step:.0f}" y="{Y+H+18}">{r["checked_at"]}</text>'
+                         for i, r in enumerate(_hist) if len(_hist) <= 6 or i % max(1, len(_hist)//6) == 0)
+    last = _hist[-1]
+    latest_html = "".join([
+        f'<span><i style="background:#3D5AFE"></i>Краулер: {last["crawler_score"]}/100</span>' if last.get("crawler_score") is not None else "",
+        f'<span><i style="background:#12946A"></i>Разметка: {last["audit_score"]}/100</span>' if last.get("audit_score") is not None else "",
+    ])
+    st.markdown(
+        f'<div class="card"><h2 class="sec">📡 Наш сайт — история готовности ({len(_hist)} провер.)</h2>'
+        f'<svg viewBox="0 0 600 145" width="100%">'
+        f'<line x1="30" y1="{Y+H}" x2="590" y2="{Y+H}" stroke="#E4E8F0"/>'
+        f'<text x="4" y="{Y+5}">100</text><text x="12" y="{Y+H+3}">0</text>'
+        f'{lines_html}{labels_html}</svg>'
+        f'<div class="legend">{latest_html}</div></div>', unsafe_allow_html=True)
+    st.write("")
+else:
+    st.caption("📡 История готовности нашего сайта появится после первой проверки краулера или разметки ниже")
+    st.write("")
+
 # ── Доступность для AI-краулеров: свой сайт + опционально чужой ──
 with st.expander("🕷️ Доступность для AI-краулеров (до проверки разметки)"):
     if not HAS_CRAWLER_CHECK:
@@ -969,7 +1030,8 @@ with st.expander("🕷️ Доступность для AI-краулеров (�
             if st.button("🕷️ Проверить наш сайт", key="check_own"):
                 with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
                     try:
-                        run_crawler_check_live(own_url)
+                        _rep = run_crawler_check_live(own_url)
+                        log_site_score(own_url, crawler_score=_rep.get("score"))
                     except Exception as e:
                         st.error(f"Ошибка: {e}")
             render_crawler_card(own_url, "Наш сайт")
@@ -1005,6 +1067,8 @@ def _run_audit_and_show(url, label):
                     catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
                     content_json, score, chash = run_site_audit(url, catalog_facts)
                     save_audit(url, score, content_json, chash)
+                    if label == "Наш сайт":
+                        log_site_score(url, audit_score=score)
                     cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
                 except Exception as e:
                     st.error(f"Ошибка аудита: {e}")
