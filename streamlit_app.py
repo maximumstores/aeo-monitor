@@ -816,69 +816,63 @@ def _render_donors_card():
         f'<div class="lab" style="margin-top:14px">Топ-доноры цитат (клик — открыть статью)</div>{donors}</div>', unsafe_allow_html=True)
 
 if len(wks) < 2:
-    # Мало данных: короткая карточка выводов рядом с длинной карточкой доноров смотрится
-    # разбалансированно — ставим их друг под другом на всю ширину.
     st.markdown(f'<div class="card"><h2 class="sec">Выводы недели — {choice}</h2>'
         f'<p style="font-size:12.5px;color:#98A2B5;margin:0 0 4px">График тренда появится, когда накопится 2+ недели данных</p>'
         f'<div style="margin-top:8px">{insight_html}</div></div>', unsafe_allow_html=True)
-    st.write("")
-    _render_donors_card()
 else:
-    left, right = st.columns([1.7, 1])
-    with left:
-        trend = sov_trend(provider)
-        series = ([(ours["brand"], "#12946A", 2.6)] if ours else []) + \
-            [(b, ["#C6CCDA","#8FB4F9"][i], 1.5)
-             for i, b in enumerate([x["brand"] for x in brands if not x["is_ours"]][:2])]
-        W,H,X,Y = 560,110,30,20
-        step = W/max(len(wks)-1,1)
-        def pts(brand):
-            vals = {r["week_start"]: float(r["sov"]) for r in trend if r["brand"]==brand}
-            return " ".join(f"{X+i*step:.0f},{Y+H-(vals.get(w,0)/100)*H:.0f}" for i,w in enumerate(wks))
-        lines = "".join(f'<polyline points="{pts(b)}" fill="none" stroke="{c}" stroke-width="{sw}" stroke-linecap="round"/>' for b,c,sw in series)
-        lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
-        labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
-        legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
+    trend = sov_trend(provider)
+    series = ([(ours["brand"], "#12946A", 2.6)] if ours else []) + \
+        [(b, ["#C6CCDA","#8FB4F9"][i], 1.5)
+         for i, b in enumerate([x["brand"] for x in brands if not x["is_ours"]][:2])]
+    W,H,X,Y = 560,110,30,20
+    step = W/max(len(wks)-1,1)
+    def pts(brand):
+        vals = {r["week_start"]: float(r["sov"]) for r in trend if r["brand"]==brand}
+        return " ".join(f"{X+i*step:.0f},{Y+H-(vals.get(w,0)/100)*H:.0f}" for i,w in enumerate(wks))
+    lines = "".join(f'<polyline points="{pts(b)}" fill="none" stroke="{c}" stroke-width="{sw}" stroke-linecap="round"/>' for b,c,sw in series)
+    lw = [wks[0], wks[len(wks)//2], wks[-1]] if len(wks) > 2 else wks
+    labels = "".join(f'<text x="{X+i*(W/max(1,len(lw)-1))}" y="150">{w}</text>' for i,w in enumerate(lw))
+    legend = "".join(f'<span><i style="background:{c}"></i>{b}</span>' for b,c,_ in series)
 
-        st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice — {choice}</h2>'
-            f'<svg viewBox="0 0 600 165" width="100%">'
-            f'<line x1="30" y1="130" x2="590" y2="130" stroke="#E4E8F0"/>'
-            f'<line x1="30" y1="75" x2="590" y2="75" stroke="#EEF1F6"/>'
-            f'<text x="4" y="78">50</text><text x="12" y="133">0</text>'
-            f'{lines}{labels}</svg><div class="legend">{legend}</div>'
-            f'<div style="margin-top:16px">{insight_html}</div></div>', unsafe_allow_html=True)
-    with right:
-        _render_donors_card()
+    st.markdown(f'<div class="card"><h2 class="sec">Тренд Share of Voice — {choice}</h2>'
+        f'<svg viewBox="0 0 600 165" width="100%">'
+        f'<line x1="30" y1="130" x2="590" y2="130" stroke="#E4E8F0"/>'
+        f'<line x1="30" y1="75" x2="590" y2="75" stroke="#EEF1F6"/>'
+        f'<text x="4" y="78">50</text><text x="12" y="133">0</text>'
+        f'{lines}{labels}</svg><div class="legend">{legend}</div>'
+        f'<div style="margin-top:16px">{insight_html}</div></div>', unsafe_allow_html=True)
+st.write("")
+_render_donors_card()
 st.write("")
 
-left, right = st.columns([1.4, 1])
-with left:
-    head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in all_provs)
-    body = ""
-    for b in brands[:10]:
-        dl = b["delta"]
-        dcls = "up" if dl and dl>0 else "dn" if dl and dl<0 else ""
-        pcells = "".join(f'<td class="n">{int(per_prov[(b["brand"],p)]) if (b["brand"],p) in per_prov else "·"}</td>' for p in all_provs)
-        body += (f'<tr class="{"ours" if b["is_ours"] else ""}"><td>{b["brand"]}</td>'
-                 f'<td class="n">{b["sov"]}%</td>'
-                 f'<td class="n {dcls}">{f"{dl:+.0f}" if dl is not None else "—"}</td>'
-                 f'<td class="n">{b["avg_pos"] or "—"}</td>{pcells}</tr>')
-    st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI — {choice}</h2>'
-        f'<table class="aeo"><tr><th>Бренд</th><th class="n">SOV</th><th class="n">Δ</th>'
-        f'<th class="n">поз.</th>{head}</tr>{body}</table></div>', unsafe_allow_html=True)
-with right:
-    def _short_url(u, maxlen=70):
-        base = u.split("?")[0]
-        return base if len(base) <= maxlen else base[:maxlen] + "…"
-    alerts = [{"sev":"HI","text":f'Выпала наша цитата: <a href="{r["url"]}" target="_blank" rel="noopener">{_short_url(r["url"])}</a>'} for r in (lost_own_urls(week, prev, provider) if prev else [])]
-    alerts += [{"sev":"MD","text":f'{b["brand"]} +{b["delta"]} п.п. за неделю'}
-               for b in brands if not b["is_ours"] and b["delta"] and b["delta"] >= 5]
-    dc = delta(own_c, own_c_prev)
-    if dc is not None and dc <= -3:
-        alerts.append({"sev":"HI","text":f"Доля own-site цитат упала на {abs(dc)} п.п."})
-    items = "".join(f'<div class="al"><span class="badge {"b-red" if a["sev"]=="HI" else "b-amb"}">{a["sev"]}</span><p>{a["text"]}</p></div>'
-        for a in alerts[:6]) or '<p style="color:#98A2B5;font-size:13px">Пока тихо — нужна вторая неделя данных для дельт.</p>'
-    st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
+# ── Кого рекомендуют AI (полная ширина) ──
+head = "".join(f'<th class="n">{P_SHORT.get(p, p[:4].upper())}</th>' for p in all_provs)
+body = ""
+for b in brands[:10]:
+    dl = b["delta"]
+    dcls = "up" if dl and dl>0 else "dn" if dl and dl<0 else ""
+    pcells = "".join(f'<td class="n">{int(per_prov[(b["brand"],p)]) if (b["brand"],p) in per_prov else "·"}</td>' for p in all_provs)
+    body += (f'<tr class="{"ours" if b["is_ours"] else ""}"><td>{b["brand"]}</td>'
+             f'<td class="n">{b["sov"]}%</td>'
+             f'<td class="n {dcls}">{f"{dl:+.0f}" if dl is not None else "—"}</td>'
+             f'<td class="n">{b["avg_pos"] or "—"}</td>{pcells}</tr>')
+st.markdown(f'<div class="card"><h2 class="sec">Кого рекомендуют AI — {choice}</h2>'
+    f'<table class="aeo"><tr><th>Бренд</th><th class="n">SOV</th><th class="n">Δ</th>'
+    f'<th class="n">поз.</th>{head}</tr>{body}</table></div>', unsafe_allow_html=True)
+st.write("")
+
+def _short_url(u, maxlen=70):
+    base = u.split("?")[0]
+    return base if len(base) <= maxlen else base[:maxlen] + "…"
+alerts = [{"sev":"HI","text":f'Выпала наша цитата: <a href="{r["url"]}" target="_blank" rel="noopener">{_short_url(r["url"])}</a>'} for r in (lost_own_urls(week, prev, provider) if prev else [])]
+alerts += [{"sev":"MD","text":f'{b["brand"]} +{b["delta"]} п.п. за неделю'}
+           for b in brands if not b["is_ours"] and b["delta"] and b["delta"] >= 5]
+dc = delta(own_c, own_c_prev)
+if dc is not None and dc <= -3:
+    alerts.append({"sev":"HI","text":f"Доля own-site цитат упала на {abs(dc)} п.п."})
+items = "".join(f'<div class="al"><span class="badge {"b-red" if a["sev"]=="HI" else "b-amb"}">{a["sev"]}</span><p>{a["text"]}</p></div>'
+    for a in alerts[:6]) or '<p style="color:#98A2B5;font-size:13px">Пока тихо — нужна вторая неделя данных для дельт.</p>'
+st.markdown(f'<div class="card"><h2 class="sec">Требует внимания</h2>{items}</div>', unsafe_allow_html=True)
 
 st.write("")
 cands = brand_candidates(week)
@@ -1027,26 +1021,29 @@ with st.expander("🕷️ Доступность для AI-краулеров (�
         cc1, cc2 = st.columns(2)
         with cc1:
             own_url = st.text_input("Наш сайт", value=default_own, key="own_crawler_url")
-            if st.button("🕷️ Проверить наш сайт", key="check_own"):
-                with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
-                    try:
-                        _rep = run_crawler_check_live(own_url)
-                        log_site_score(own_url, crawler_score=_rep.get("score"))
-                    except Exception as e:
-                        st.error(f"Ошибка: {e}")
-            render_crawler_card(own_url, "Наш сайт")
+            own_clicked = st.button("🕷️ Проверить наш сайт", key="check_own")
         with cc2:
             other_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_crawler_url")
-            if st.button("🕷️ Проверить чужой сайт", key="check_other", disabled=not other_url):
-                with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
-                    try:
-                        run_crawler_check_live(other_url)
-                    except Exception as e:
-                        st.error(f"Ошибка: {e}")
-            if other_url:
-                render_crawler_card(other_url, "Чужой сайт")
-            else:
-                st.caption("Введи URL конкурента, чтобы сравнить доступность бок о бок")
+            other_clicked = st.button("🕷️ Проверить чужой сайт", key="check_other", disabled=not other_url)
+        if own_clicked:
+            with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
+                try:
+                    _rep = run_crawler_check_live(own_url)
+                    log_site_score(own_url, crawler_score=_rep.get("score"))
+                except Exception as e:
+                    st.error(f"Ошибка: {e}")
+        render_crawler_card(own_url, "Наш сайт")
+        st.write("")
+        if other_clicked:
+            with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
+                try:
+                    run_crawler_check_live(other_url)
+                except Exception as e:
+                    st.error(f"Ошибка: {e}")
+        if other_url:
+            render_crawler_card(other_url, "Чужой сайт")
+        else:
+            st.caption("Введи URL конкурента, чтобы сравнить доступность бок о бок")
 
 st.write("")
 # ── Agent Readiness: аудит страницы сайта (наш сайт + опционально чужой) ──
@@ -1106,13 +1103,14 @@ with st.expander("🔍 Аудит сайта — Agent Readiness"):
     ac1, ac2 = st.columns(2)
     with ac1:
         own_audit_url = st.text_input("Наш сайт", value=default_audit_own, key="own_audit_url")
-        _run_audit_and_show(own_audit_url, "Наш сайт")
     with ac2:
         other_audit_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_audit_url")
-        if other_audit_url:
-            _run_audit_and_show(other_audit_url, "Чужой сайт")
-        else:
-            st.caption("Введи URL конкурента, чтобы сравнить agent readiness бок о бок")
+    _run_audit_and_show(own_audit_url, "Наш сайт")
+    st.write("")
+    if other_audit_url:
+        _run_audit_and_show(other_audit_url, "Чужой сайт")
+    else:
+        st.caption("Введи URL конкурента, чтобы сравнить agent readiness бок о бок")
 
 st.write("")
 # ── Rung 2: Фактчек бренда ──
