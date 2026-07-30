@@ -635,6 +635,7 @@ def render_ai_report(content_json, model_choice, choice):
         data = _json.loads(content_json)
         situation, conclusion = data["situation"], data["conclusion"]
         actions = data.get("actions", [])
+        sources = data.get("sources", [])
     except (_json.JSONDecodeError, KeyError, TypeError):
         st.markdown(f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>'
                     f'{content_json}</div>', unsafe_allow_html=True)
@@ -654,6 +655,20 @@ def render_ai_report(content_json, model_choice, choice):
             f'</div><div style="font-size:13px;color:#4E5C53;margin-top:5px;line-height:1.5">{a.get("detail","")}</div>'
             f'</div>')
 
+    sources_html = ""
+    if sources:
+        rows = "".join(
+            f'<div class="crow" style="align-items:flex-start">'
+            f'<img src="{favicon(src.get("domain",""))}" width="14" height="14" '
+            f'style="margin-top:2px;border-radius:3px;flex-shrink:0">'
+            f'<a href="{src.get("url","#")}" target="_blank" rel="noopener" '
+            f'style="margin-left:8px;flex:1;font-size:12px;color:#3D5AFE;overflow:hidden;'
+            f'text-overflow:ellipsis;white-space:nowrap">{src.get("domain","") or src.get("url","")}</a>'
+            f'<span style="font-size:11px;color:#98A2B5;margin-left:8px;max-width:45%;text-align:right">{src.get("note","")}</span>'
+            f'</div>'
+            for src in sources)
+        sources_html = f'<div class="lab" style="margin-top:14px">Источники</div>{rows}'
+
     st.markdown(
         f'<div class="card"><h2 class="sec">🤖 Разбор недели — {model_choice} · {choice}</h2>'
         f'<div style="margin-bottom:14px">'
@@ -669,6 +684,7 @@ def render_ai_report(content_json, model_choice, choice):
         f'{action_cards}'
         f'<p style="font-size:11.5px;color:#98A2B5;margin-top:6px">Эффект каждого действия проверяется через '
         f'⚗ Эксперименты после публикации, а не оценивается заранее.</p>'
+        f'{sources_html}'
         f'</div>', unsafe_allow_html=True)
 
 def _build_report_prompt(context_text):
@@ -814,9 +830,14 @@ def build_web_research_prompt(niche, competitors, lang_instruction):
     {{"title": "короткий заголовок (3-6 слов)",
       "detail": "конкретное действие на основе найденного пробела",
       "priority": "fast_cheap"}}
+  ],
+  "sources": [
+    {{"domain": "example.com", "url": "https://example.com/полный-реальный-url-со-страницы-из-поиска",
+      "note": "что именно оттуда взято (1 короткая фраза)"}}
   ]
 }}
-В "actions" — от 3 до 5 пунктов."""
+В "actions" — от 3 до 5 пунктов. В "sources" — от 5 до 10 пунктов: РЕАЛЬНЫЕ url-адреса страниц,
+которые ты реально открыл через web_search (не выдумывай и не сокращай их, копируй как есть)."""
 
 
 def ai_web_research(niche, competitors, lang="Русский"):
