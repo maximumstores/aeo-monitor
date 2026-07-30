@@ -1054,6 +1054,74 @@ if _wr_cached:
 else:
     st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
 st.write("")
+st.write("")
+# ── Agent Readiness: аудит страницы сайта (наш сайт + опционально чужой) ──
+def _run_audit_and_show(url, label):
+    if not url:
+        st.caption(f"{label}: введи URL, чтобы запустить аудит")
+        return
+    cached_audit = get_cached_audit(url)
+    clicked = st.button(
+        f"🔍 {'Обновить' if cached_audit else 'Запустить'} аудит — {label}",
+        use_container_width=True, key=f"audit_btn_{label}")
+    if clicked:
+        if not ANTHROPIC_API_KEY:
+            st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
+        else:
+            with st.status("Запускаю аудит agent readiness...", expanded=True) as status_box:
+                try:
+                    catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
+                    content_json, score, chash = run_site_audit(url, catalog_facts, log=status_box.write)
+                    save_audit(url, score, content_json, chash)
+                    if label == "Наш сайт":
+                        log_site_score(url, audit_score=score)
+                    cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
+                    status_box.update(label=f"Аудит завершён — score {score}/100", state="complete")
+                except Exception as e:
+                    status_box.update(label="Ошибка аудита", state="error")
+                    st.error(f"Ошибка аудита: {e}")
+                    cached_audit = None
+    if cached_audit:
+        import json as _json2
+        try:
+            adata = _json2.loads(cached_audit["content"])
+            score = cached_audit["score"] or 0
+            score_color = "#12946A" if score >= 70 else "#C07E14" if score >= 40 else "#D6452C"
+            findings_html = "".join(
+                f'<div class="al"><span class="badge" style="background:'
+                f'{"#E1F5EC" if f["status"]=="ok" else "#FBF1DC" if f["status"]=="mismatch" else "#FBE9E4"};'
+                f'color:{"#12946A" if f["status"]=="ok" else "#C07E14" if f["status"]=="mismatch" else "#D6452C"}">'
+                f'{f["status"]}</span><p><b>{f["check"]}</b><br>{f["detail"]}</p></div>'
+                for f in adata.get("findings", []))
+            recs_html = "".join(f'<li style="font-size:13px;color:#1A2233;margin-bottom:4px">{r}</li>'
+                                for r in adata.get("recommendations", []))
+            st.markdown(
+                f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h2 class="sec" style="margin:0">{label}</h2>'
+                f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
+                f'<div style="margin-top:10px">{findings_html}</div>'
+                f'<div class="lab" style="margin-top:12px">Что делать</div>'
+                f'<ul style="margin:4px 0 0;padding-left:18px">{recs_html}</ul></div>',
+                unsafe_allow_html=True)
+        except Exception:
+            st.caption("Не удалось разобрать сохранённый результат — запусти аудит заново")
+    else:
+        st.caption(f"{label}: ещё не проверялся — нажми кнопку выше")
+
+
+with st.expander("🔍 Аудит сайта — Agent Readiness"):
+    default_audit_own = default_own if "default_own" in dir() else (NICHE if NICHE.startswith("http") else f"https://{NICHE}")
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        own_audit_url = st.text_input("Наш сайт", value=default_audit_own, key="own_audit_url")
+    with ac2:
+        other_audit_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_audit_url")
+    _run_audit_and_show(own_audit_url, "Наш сайт")
+    st.write("")
+    if other_audit_url:
+        _run_audit_and_show(other_audit_url, "Чужой сайт")
+    else:
+        st.caption("Введи URL конкурента, чтобы сравнить agent readiness бок о бок")
 
 leader = brands[0] if brands else None
 insights = []
@@ -1393,74 +1461,6 @@ with st.expander("🕷️ Доступность для AI-краулеров (�
         else:
             st.caption("Введи URL конкурента, чтобы сравнить доступность бок о бок")
 
-st.write("")
-# ── Agent Readiness: аудит страницы сайта (наш сайт + опционально чужой) ──
-def _run_audit_and_show(url, label):
-    if not url:
-        st.caption(f"{label}: введи URL, чтобы запустить аудит")
-        return
-    cached_audit = get_cached_audit(url)
-    clicked = st.button(
-        f"🔍 {'Обновить' if cached_audit else 'Запустить'} аудит — {label}",
-        use_container_width=True, key=f"audit_btn_{label}")
-    if clicked:
-        if not ANTHROPIC_API_KEY:
-            st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
-        else:
-            with st.status("Запускаю аудит agent readiness...", expanded=True) as status_box:
-                try:
-                    catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
-                    content_json, score, chash = run_site_audit(url, catalog_facts, log=status_box.write)
-                    save_audit(url, score, content_json, chash)
-                    if label == "Наш сайт":
-                        log_site_score(url, audit_score=score)
-                    cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
-                    status_box.update(label=f"Аудит завершён — score {score}/100", state="complete")
-                except Exception as e:
-                    status_box.update(label="Ошибка аудита", state="error")
-                    st.error(f"Ошибка аудита: {e}")
-                    cached_audit = None
-    if cached_audit:
-        import json as _json2
-        try:
-            adata = _json2.loads(cached_audit["content"])
-            score = cached_audit["score"] or 0
-            score_color = "#12946A" if score >= 70 else "#C07E14" if score >= 40 else "#D6452C"
-            findings_html = "".join(
-                f'<div class="al"><span class="badge" style="background:'
-                f'{"#E1F5EC" if f["status"]=="ok" else "#FBF1DC" if f["status"]=="mismatch" else "#FBE9E4"};'
-                f'color:{"#12946A" if f["status"]=="ok" else "#C07E14" if f["status"]=="mismatch" else "#D6452C"}">'
-                f'{f["status"]}</span><p><b>{f["check"]}</b><br>{f["detail"]}</p></div>'
-                for f in adata.get("findings", []))
-            recs_html = "".join(f'<li style="font-size:13px;color:#1A2233;margin-bottom:4px">{r}</li>'
-                                for r in adata.get("recommendations", []))
-            st.markdown(
-                f'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<h2 class="sec" style="margin:0">{label}</h2>'
-                f'<span style="font-family:Manrope;font-weight:800;font-size:26px;color:{score_color}">{score}/100</span></div>'
-                f'<div style="margin-top:10px">{findings_html}</div>'
-                f'<div class="lab" style="margin-top:12px">Что делать</div>'
-                f'<ul style="margin:4px 0 0;padding-left:18px">{recs_html}</ul></div>',
-                unsafe_allow_html=True)
-        except Exception:
-            st.caption("Не удалось разобрать сохранённый результат — запусти аудит заново")
-    else:
-        st.caption(f"{label}: ещё не проверялся — нажми кнопку выше")
-
-
-with st.expander("🔍 Аудит сайта — Agent Readiness"):
-    default_audit_own = default_own if "default_own" in dir() else (NICHE if NICHE.startswith("http") else f"https://{NICHE}")
-    ac1, ac2 = st.columns(2)
-    with ac1:
-        own_audit_url = st.text_input("Наш сайт", value=default_audit_own, key="own_audit_url")
-    with ac2:
-        other_audit_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_audit_url")
-    _run_audit_and_show(own_audit_url, "Наш сайт")
-    st.write("")
-    if other_audit_url:
-        _run_audit_and_show(other_audit_url, "Чужой сайт")
-    else:
-        st.caption("Введи URL конкурента, чтобы сравнить agent readiness бок о бок")
 
 st.write("")
 # ── Rung 2: Фактчек бренда ──
