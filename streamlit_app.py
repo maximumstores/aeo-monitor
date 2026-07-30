@@ -780,7 +780,11 @@ def ai_analyze_gemini(context_text):
     return json.dumps(data, ensure_ascii=False)
 
 
-def build_web_research_prompt(niche, competitors):
+WEB_RESEARCH_LANGS = {"Русский": "Отвечай строго на русском языке.",
+                       "English": "Answer strictly in English."}
+
+
+def build_web_research_prompt(niche, competitors, lang_instruction):
     comp_str = ", ".join(competitors[:8]) if competitors else "конкуренты не заданы в конфиге"
     return f"""Ты — консультант по AEO/GEO (видимость бренда в ответах AI-агентов).
 Бренд: {niche}. Известные конкуренты в нише: {comp_str}.
@@ -799,6 +803,8 @@ def build_web_research_prompt(niche, competitors):
    Если что-то не нашлось — не упоминай это, а не додумывай.
 2. Каждое утверждение о цифрах (рейтинги, оценки) должно быть тем, что ты реально увидел в поиске.
 3. Приоритет каждого действия — строго одно из: "fast_cheap", "medium", "slow_expensive".
+4. {lang_instruction} Весь текст внутри JSON (situation/conclusion/title/detail) должен быть
+   на этом языке, независимо от языка найденных источников.
 
 ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON (без markdown-обёртки), когда закончишь поиск:
 {{
@@ -813,12 +819,13 @@ def build_web_research_prompt(niche, competitors):
 В "actions" — от 3 до 5 пунктов."""
 
 
-def ai_web_research(niche, competitors):
+def ai_web_research(niche, competitors, lang="Русский"):
     import json as _json
     import anthropic
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = build_web_research_prompt(niche, competitors)
+    lang_instruction = WEB_RESEARCH_LANGS.get(lang, WEB_RESEARCH_LANGS["Русский"])
+    prompt = build_web_research_prompt(niche, competitors, lang_instruction)
     resp = client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=4000,
@@ -943,6 +950,38 @@ with c1: kpi("Share of Voice", f'{ours["sov"] if ours else 0}%',
 with c2: kpi("Цитаты нашего сайта", f'{own_c}%', delta(own_c, own_c_prev))
 with c3: kpi("Средняя позиция", (ours or {}).get("avg_pos") or "—")
 with c4: kpi("Недель данных", len(wks))
+st.write("")
+
+# ── Веб-исследование бренда: живой поиск в сети (не по нашим данным, а по интернету) ──
+# Открытая секция, не аккордеон — видна сразу, в самом начале дашборда.
+st.markdown('<div class="lab" style="font-size:15px;font-weight:700;color:#1A2233;margin-bottom:2px">🌐 Веб-исследование бренда</div>', unsafe_allow_html=True)
+st.caption("Claude ищет в интернете: как независимые обзорники и отзовики видят бренд, "
+           "кто реально побеждает в нише сейчас, и какие есть репутационные пробелы. "
+           "Это медленно меняющиеся вещи — кэшируется на неделю, не на каждый клик.")
+wr_lang_col, wr_btn_col = st.columns([2, 3])
+with wr_lang_col:
+    wr_lang = st.radio("Язык ответа", list(WEB_RESEARCH_LANGS.keys()), horizontal=True,
+                        key="wr_lang_choice", label_visibility="collapsed")
+_wr_cached = get_web_research_cache(week)
+with wr_btn_col:
+    wr_clicked = st.button(
+        "🌐 Обновить веб-исследование" if _wr_cached else "🌐 Запустить веб-исследование",
+        key="web_research_btn")
+if wr_clicked:
+    if not ANTHROPIC_API_KEY:
+        st.error("ANTHROPIC_API_KEY не найден в Secrets")
+    else:
+        with st.spinner("Ищу в интернете (может занять минуту — несколько запросов)..."):
+            try:
+                _wr_content = ai_web_research(NICHE, COMPETITORS, wr_lang)
+                save_web_research_cache(week, _wr_content)
+                _wr_cached = {"content": _wr_content}
+            except Exception as e:
+                st.error(f"Ошибка веб-исследования: {e}")
+if _wr_cached:
+    render_ai_report(_wr_cached["content"], "Claude + web search", "внешний контекст")
+else:
+    st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
 st.write("")
 
 leader = brands[0] if brands else None
@@ -1439,32 +1478,6 @@ else:
         st.caption(f"Разбор от {model_choice} ещё не сгенерирован для этого среза — нажми кнопку выше")
 
 st.write("")
-# ── Веб-исследование бренда: живой поиск в сети (не по нашим данным, а по интернету) ──
-# Открытая секция, не аккордеон — видна сразу, как основной AI-разбор выше.
-st.markdown('<div class="lab" style="font-size:15px;font-weight:700;color:#1A2233;margin-bottom:2px">🌐 Веб-исследование бренда</div>', unsafe_allow_html=True)
-st.caption("Claude ищет в интернете: как независимые обзорники и отзовики видят бренд, "
-           "кто реально побеждает в нише сейчас, и какие есть репутационные пробелы. "
-           "Это медленно меняющиеся вещи — кэшируется на неделю, не на каждый клик.")
-_wr_cached = get_web_research_cache(week)
-wr_clicked = st.button(
-    "🌐 Обновить веб-исследование" if _wr_cached else "🌐 Запустить веб-исследование",
-    key="web_research_btn")
-if wr_clicked:
-    if not ANTHROPIC_API_KEY:
-        st.error("ANTHROPIC_API_KEY не найден в Secrets")
-    else:
-        with st.spinner("Ищу в интернете (может занять минуту — несколько запросов)..."):
-            try:
-                _wr_content = ai_web_research(NICHE, COMPETITORS)
-                save_web_research_cache(week, _wr_content)
-                _wr_cached = {"content": _wr_content}
-            except Exception as e:
-                st.error(f"Ошибка веб-исследования: {e}")
-if _wr_cached:
-    render_ai_report(_wr_cached["content"], "Claude + web search", "внешний контекст")
-else:
-    st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
-
 st.write("")
 with st.expander("⚗ Эксперименты — гипотеза → действие → измеренный результат"):
     with st.form("new_experiment", clear_on_submit=True):
