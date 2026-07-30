@@ -128,12 +128,14 @@ with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
 
 NICHE, N_QUERIES = "merino.tech", 16
 ALIASES = [NICHE]
+COMPETITORS = []
 try:
     import yaml
     _cfg = yaml.safe_load(Path("queries.yaml").read_text(encoding="utf-8"))
     NICHE = (_cfg.get("brands", {}).get("ours") or [NICHE])[0]
     N_QUERIES = len(_cfg.get("queries", [])) or N_QUERIES
     ALIASES = _cfg.get("aliases", {}).get(NICHE, [NICHE]) or [NICHE]
+    COMPETITORS = _cfg.get("brands", {}).get("competitors", [])
 except Exception:
     pass
 
@@ -727,6 +729,65 @@ def ai_analyze_gemini(context_text):
     raw = resp.text or ""
     data = _extract_json(raw)
     return json.dumps(data, ensure_ascii=False)
+
+
+def build_web_research_prompt(niche, competitors):
+    comp_str = ", ".join(competitors[:8]) if competitors else "конкуренты не заданы в конфиге"
+    return f"""Ты — консультант по AEO/GEO (видимость бренда в ответах AI-агентов).
+Бренд: {niche}. Известные конкуренты в нише: {comp_str}.
+
+Используй web_search, чтобы найти АКТУАЛЬНУЮ информацию и ответить на четыре вопроса:
+1. Семантический профиль: с какими характеристиками, ценовым сегментом, качеством независимые
+   источники (обзорники, маркетплейсы, отзовики) связывают этот бренд?
+2. Конкуренты: кто реально доминирует в независимых обзорах/гайдах по этой нише сейчас,
+   и почему (больше площадок с тестами, больше консенсуса)?
+3. Репутация: есть ли независимые оценки (Trustpilot и подобные), что там говорят —
+   это отдельный сигнал от того, что показывает сам сайт бренда.
+4. Пробелы: чего не хватает в публичном присутствии бренда, чтобы AI увереннее его рекомендовал?
+
+СТРОГИЕ ПРАВИЛА:
+1. Используй ТОЛЬКО факты, реально найденные через web_search — ничего не выдумывай.
+   Если что-то не нашлось — не упоминай это, а не додумывай.
+2. Каждое утверждение о цифрах (рейтинги, оценки) должно быть тем, что ты реально увидел в поиске.
+3. Приоритет каждого действия — строго одно из: "fast_cheap", "medium", "slow_expensive".
+
+ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON (без markdown-обёртки), когда закончишь поиск:
+{{
+  "situation": "2-4 предложения: семантический профиль + конкурентная картина + репутация, с конкретными находками из поиска",
+  "conclusion": "2-3 предложения: что это значит для видимости бренда в AI-ответах",
+  "actions": [
+    {{"title": "короткий заголовок (3-6 слов)",
+      "detail": "конкретное действие на основе найденного пробела",
+      "priority": "fast_cheap"}}
+  ]
+}}
+В "actions" — от 3 до 5 пунктов."""
+
+
+def ai_web_research(niche, competitors):
+    import json as _json
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    prompt = build_web_research_prompt(niche, competitors)
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=4000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text_parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+    raw = "\n".join(text_parts)
+    data = _extract_json(raw)
+    return _json.dumps(data, ensure_ascii=False)
+
+
+def get_web_research_cache(week):
+    return get_cached_insight(week, "web_research")
+
+
+def save_web_research_cache(week, content_json):
+    save_insight(week, "web_research", content_json, "n/a")
 
 
 AI_MODELS = {}
@@ -1327,6 +1388,32 @@ else:
         render_ai_report(cached["content"], model_choice, choice)
     else:
         st.caption(f"Разбор от {model_choice} ещё не сгенерирован для этого среза — нажми кнопку выше")
+
+st.write("")
+# ── Веб-исследование бренда: живой поиск в сети (не по нашим данным, а по интернету) ──
+with st.expander("🌐 Веб-исследование бренда"):
+    st.caption("Claude ищет в интернете: как независимые обзорники и отзовики видят бренд, "
+               "кто реально побеждает в нише сейчас, и какие есть репутационные пробелы. "
+               "Это медленно меняющиеся вещи — кэшируется на неделю, не на каждый клик.")
+    _wr_cached = get_web_research_cache(week)
+    wr_clicked = st.button(
+        "🌐 Обновить веб-исследование" if _wr_cached else "🌐 Запустить веб-исследование",
+        key="web_research_btn")
+    if wr_clicked:
+        if not ANTHROPIC_API_KEY:
+            st.error("ANTHROPIC_API_KEY не найден в Secrets")
+        else:
+            with st.spinner("Ищу в интернете (может занять минуту — несколько запросов)..."):
+                try:
+                    _wr_content = ai_web_research(NICHE, COMPETITORS)
+                    save_web_research_cache(week, _wr_content)
+                    _wr_cached = {"content": _wr_content}
+                except Exception as e:
+                    st.error(f"Ошибка веб-исследования: {e}")
+    if _wr_cached:
+        render_ai_report(_wr_cached["content"], "Claude + web search", "внешний контекст")
+    else:
+        st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
 
 st.write("")
 with st.expander("⚗ Эксперименты — гипотеза → действие → измеренный результат"):
