@@ -1109,7 +1109,7 @@ def _run_audit_and_show(url, label):
         st.caption(f"{label}: ещё не проверялся — нажми кнопку выше")
 
 
-with st.expander("🔍 Аудит сайта — Agent Readiness"):
+with st.expander(":blue[🔍 **Аудит сайта — Agent Readiness**]"):
     st.markdown('<div style="display:inline-block;background:#E6ECFE;color:#1F3FBD;'
                 'font-family:\'IBM Plex Mono\',monospace;font-size:11px;font-weight:600;'
                 'padding:4px 12px;border-radius:999px;margin-bottom:10px;letter-spacing:.03em">'
