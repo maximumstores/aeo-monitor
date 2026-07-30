@@ -859,12 +859,44 @@ def ai_web_research(niche, competitors, lang="Русский"):
     return _json.dumps(data, ensure_ascii=False)
 
 
-def get_web_research_cache(week):
-    return get_cached_insight(week, "web_research")
+def ai_web_research_gemini(niche, competitors, lang="Русский"):
+    import base64
+    import json as _json
+
+    from google import genai
+    from google.genai import types
+
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        from google.oauth2 import service_account
+
+        info = _json.loads(base64.b64decode(VERTEX_SA_JSON_B64))
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        project = VERTEX_PROJECT or info.get("project_id")
+        client = genai.Client(vertexai=True, project=project, location=VERTEX_LOCATION, credentials=creds)
+
+    lang_instruction = WEB_RESEARCH_LANGS.get(lang, WEB_RESEARCH_LANGS["Русский"])
+    prompt = build_web_research_prompt(niche, competitors, lang_instruction)
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
+    )
+    raw = resp.text or ""
+    data = _extract_json(raw)
+    return _json.dumps(data, ensure_ascii=False)
 
 
-def save_web_research_cache(week, content_json):
-    save_insight(week, "web_research", content_json, "n/a")
+def get_web_research_cache(week, model_suffix):
+    return get_cached_insight(week, f"web_research::{model_suffix}")
+
+
+def save_web_research_cache(week, model_suffix, content_json):
+    save_insight(week, f"web_research::{model_suffix}", content_json, "n/a")
 
 
 AI_MODELS = {}
@@ -872,6 +904,12 @@ if ANTHROPIC_API_KEY:
     AI_MODELS["Claude"] = ("claude", ai_analyze)
 if GEMINI_API_KEY or VERTEX_SA_JSON_B64:
     AI_MODELS["Gemini"] = ("gemini", ai_analyze_gemini)
+
+WEB_RESEARCH_MODELS = {}
+if ANTHROPIC_API_KEY:
+    WEB_RESEARCH_MODELS["Claude"] = ("claude", ai_web_research)
+if GEMINI_API_KEY or VERTEX_SA_JSON_B64:
+    WEB_RESEARCH_MODELS["Gemini"] = ("gemini", ai_web_research_gemini)
 
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Golos+Text:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -976,31 +1014,36 @@ st.write("")
 # ── Веб-исследование бренда: живой поиск в сети (не по нашим данным, а по интернету) ──
 # Открытая секция, не аккордеон — видна сразу, в самом начале дашборда.
 st.markdown('<div class="lab" style="font-size:15px;font-weight:700;color:#1A2233;margin-bottom:2px">🌐 Веб-исследование бренда</div>', unsafe_allow_html=True)
-st.caption("Claude ищет в интернете: как независимые обзорники и отзовики видят бренд, "
+st.caption("Ищет в интернете: как независимые обзорники и отзовики видят бренд, "
            "кто реально побеждает в нише сейчас, и какие есть репутационные пробелы. "
            "Это медленно меняющиеся вещи — кэшируется на неделю, не на каждый клик.")
-wr_lang_col, wr_btn_col = st.columns([2, 3])
-with wr_lang_col:
-    wr_lang = st.radio("Язык ответа", list(WEB_RESEARCH_LANGS.keys()), horizontal=True,
-                        key="wr_lang_choice", label_visibility="collapsed")
-_wr_cached = get_web_research_cache(week)
-with wr_btn_col:
-    wr_clicked = st.button(
-        "🌐 Обновить веб-исследование" if _wr_cached else "🌐 Запустить веб-исследование",
-        key="web_research_btn")
-if wr_clicked:
-    if not ANTHROPIC_API_KEY:
-        st.error("ANTHROPIC_API_KEY не найден в Secrets")
-    else:
+if not WEB_RESEARCH_MODELS:
+    st.caption("Добавь ANTHROPIC_API_KEY или GEMINI_API_KEY/VERTEX_SA_JSON_B64 в Secrets, чтобы включить веб-исследование")
+    _wr_cached = None
+else:
+    wr_model_col, wr_lang_col, wr_btn_col = st.columns([2, 2, 3])
+    with wr_model_col:
+        wr_model_choice = st.radio("Модель", list(WEB_RESEARCH_MODELS.keys()), horizontal=True,
+                                    key="wr_model_choice", label_visibility="collapsed")
+    wr_model_suffix, wr_fn = WEB_RESEARCH_MODELS[wr_model_choice]
+    with wr_lang_col:
+        wr_lang = st.radio("Язык ответа", list(WEB_RESEARCH_LANGS.keys()), horizontal=True,
+                            key="wr_lang_choice", label_visibility="collapsed")
+    _wr_cached = get_web_research_cache(week, wr_model_suffix)
+    with wr_btn_col:
+        wr_clicked = st.button(
+            f"🌐 {'Обновить' if _wr_cached else 'Запустить'} веб-исследование ({wr_model_choice})",
+            key="web_research_btn")
+    if wr_clicked:
         with st.spinner("Ищу в интернете (может занять минуту — несколько запросов)..."):
             try:
-                _wr_content = ai_web_research(NICHE, COMPETITORS, wr_lang)
-                save_web_research_cache(week, _wr_content)
+                _wr_content = wr_fn(NICHE, COMPETITORS, wr_lang)
+                save_web_research_cache(week, wr_model_suffix, _wr_content)
                 _wr_cached = {"content": _wr_content}
             except Exception as e:
                 st.error(f"Ошибка веб-исследования: {e}")
 if _wr_cached:
-    render_ai_report(_wr_cached["content"], "Claude + web search", "внешний контекст")
+    render_ai_report(_wr_cached["content"], f"{wr_model_choice} + web search" if WEB_RESEARCH_MODELS else "?", "внешний контекст")
 else:
     st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
 st.write("")
