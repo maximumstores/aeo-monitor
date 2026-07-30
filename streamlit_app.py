@@ -551,8 +551,14 @@ URL: {url}
 Реальные факты о товаре (наш каталог, для сверки точности разметки):
 {facts_str}
 
-Проверь страницу по чек-листу agent readiness и ответь СТРОГО JSON (без markdown-обёртки).
-Используй "@type" из списка выше как источник правды — не утверждай "missing", если нужный @type там есть.
+У тебя есть доступ к web_search. Используй его ТОЛЬКО как вспомогательный инструмент — например,
+свериться с актуальными рекомендациями Schema.org/Google для e-commerce, посмотреть, как аналогичные
+страницы в этой нише размечают Product/Review/FAQ, или проверить актуальность формата конкретного
+типа разметки. НЕ используй web_search, чтобы судить о статусе проверок ok/missing/mismatch —
+эти статусы должны основываться ИСКЛЮЧИТЕЛЬНО на реальном HTML этой конкретной страницы, который
+уже дан тебе выше. Если поиск не нужен — не используй его вовсе, чтобы не тратить время.
+
+Проверь страницу по чек-листу agent readiness и ответь СТРОГО JSON (без markdown-обёртки), когда закончишь:
 {{
   "score": 0-100,
   "findings": [
@@ -585,12 +591,13 @@ def run_site_audit(url, catalog_facts, log=None):
     _log(f"sitemap.xml: {extracted['sitemap_status']}")
 
     prompt = build_audit_prompt(url, extracted, catalog_facts)
-    _log("Отправляю на анализ в Claude (6 смысловых проверок)...")
+    _log("Отправляю на анализ в Claude (6 смысловых проверок, с доступом к web_search при необходимости)...")
 
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
-        model="claude-sonnet-4-5", max_tokens=1500,
+        model="claude-sonnet-4-5", max_tokens=2000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         messages=[{"role": "user", "content": prompt}],
     )
     raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
