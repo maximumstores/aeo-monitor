@@ -451,7 +451,8 @@ def context_hash(context_text):
 
 def fetch_page_for_audit(url):
     """Скачивает страницу сама (без AI web_search — надёжнее и дешевле для конкретного URL).
-    Возвращает: raw_html, jsonld_blocks (список сырых JSON-LD скриптов), visible_text, llms_txt_status."""
+    Возвращает сырые данные + то, что определяется кодом напрямую, без Claude:
+    llms.txt, sitemap.xml, реальные @type из найденных JSON-LD блоков."""
     import re
     import requests
     from urllib.parse import urlparse
@@ -462,6 +463,7 @@ def fetch_page_for_audit(url):
 
     jsonld_pattern = "<script[^>]+type=[\"']application/ld\\+json[\"'][^>]*>(.*?)</script>"
     jsonld_blocks = re.findall(jsonld_pattern, html, flags=re.IGNORECASE | re.DOTALL)
+    jsonld_types = sorted({t for b in jsonld_blocks for t in re.findall(r'"@type"\s*:\s*"([^"]+)"', b)})
 
     no_script = re.sub(r'<script.*?</script>', ' ', html, flags=re.IGNORECASE | re.DOTALL)
     no_style = re.sub(r'<style.*?</style>', ' ', no_script, flags=re.IGNORECASE | re.DOTALL)
@@ -469,16 +471,25 @@ def fetch_page_for_audit(url):
     visible_text = re.sub(r'\s+', ' ', visible_text).strip()[:4000]
 
     domain = urlparse(url).scheme + "://" + urlparse(url).netloc
+
     try:
         r2 = requests.get(domain + "/llms.txt", timeout=10)
         llms_txt_status = "найден" if r2.status_code == 200 else f"не найден (код {r2.status_code})"
     except Exception:
         llms_txt_status = "не найден (ошибка запроса)"
 
+    try:
+        r3 = requests.get(domain + "/sitemap.xml", timeout=10)
+        sitemap_status = "найден" if r3.status_code == 200 else f"не найден (код {r3.status_code})"
+    except Exception:
+        sitemap_status = "не найден (ошибка запроса)"
+
     return {
         "jsonld_blocks": jsonld_blocks[:5],
+        "jsonld_types": jsonld_types,
         "visible_text": visible_text,
         "llms_txt_status": llms_txt_status,
+        "sitemap_status": sitemap_status,
         "raw_len": len(html),
     }
 
@@ -487,11 +498,12 @@ def build_audit_prompt(url, extracted, catalog_facts):
     import json as _json
     facts_str = _json.dumps(catalog_facts, ensure_ascii=False) if catalog_facts else "не заданы"
     jsonld_str = "\n---\n".join(extracted["jsonld_blocks"]) if extracted["jsonld_blocks"] else "не найдено ни одного JSON-LD блока"
+    types_str = ", ".join(extracted["jsonld_types"]) if extracted["jsonld_types"] else "ни одного @type не найдено"
 
     return f"""Ты — аудитор "agent readiness" (готовности страницы к машинному чтению AI-агентами).
 
 URL: {url}
-llms.txt на сайте: {extracted["llms_txt_status"]}
+Реально найденные @type в JSON-LD на странице (не гадай, используй только эти): {types_str}
 Найденные JSON-LD блоки на странице:
 {jsonld_str}
 
@@ -501,25 +513,41 @@ llms.txt на сайте: {extracted["llms_txt_status"]}
 Реальные факты о товаре (наш каталог, для сверки точности разметки):
 {facts_str}
 
-Проверь страницу по чек-листу agent readiness и ответь СТРОГО JSON (без markdown-обёртки):
+Проверь страницу по чек-листу agent readiness и ответь СТРОГО JSON (без markdown-обёртки).
+Используй "@type" из списка выше как источник правды — не утверждай "missing", если нужный @type там есть.
 {{
   "score": 0-100,
   "findings": [
     {{"check": "Product/Offer JSON-LD", "status": "ok"|"missing"|"mismatch", "detail": "..."}},
     {{"check": "Review/AggregateRating JSON-LD", "status": "...", "detail": "..."}},
     {{"check": "FAQPage разметка", "status": "...", "detail": "..."}},
-    {{"check": "llms.txt", "status": "...", "detail": "..."}},
+    {{"check": "BreadcrumbList JSON-LD", "status": "...", "detail": "..."}},
+    {{"check": "Organization/WebSite JSON-LD", "status": "...", "detail": "..."}},
     {{"check": "машиночитаемые атрибуты (GSM/состав/размеры) в тексте или JSON-LD", "status": "...", "detail": "..."}}
   ],
   "recommendations": ["конкретное действие 1", "конкретное действие 2"]
 }}
-score считай как процент чек-листа со статусом ok. Будь строг: если JSON-LD пуст — Product/Offer это "missing", не "ok"."""
+Оцени только эти 6 пунктов (llms.txt и sitemap.xml проверяются отдельно кодом, не тобой — не включай их в findings).
+Будь строг: если нужного @type нет в списке выше — статус "missing", не "ok"."""
 
 
-def run_site_audit(url, catalog_facts):
+def run_site_audit(url, catalog_facts, log=None):
+    """log — необязательная функция(str), вызывается на каждом шаге для показа прогресса в UI."""
+    def _log(msg):
+        if log:
+            log(msg)
+
     import json as _json
+
+    _log("Скачиваю страницу и разбираю HTML...")
     extracted = fetch_page_for_audit(url)
+    _log(f"Найдено JSON-LD блоков: {len(extracted['jsonld_blocks'])}"
+         + (f", типы: {', '.join(extracted['jsonld_types'])}" if extracted['jsonld_types'] else " (пусто)"))
+    _log(f"llms.txt: {extracted['llms_txt_status']}")
+    _log(f"sitemap.xml: {extracted['sitemap_status']}")
+
     prompt = build_audit_prompt(url, extracted, catalog_facts)
+    _log("Отправляю на анализ в Claude (6 смысловых проверок)...")
 
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -528,7 +556,6 @@ def run_site_audit(url, catalog_facts):
         messages=[{"role": "user", "content": prompt}],
     )
     raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-    import json as _json
     t = _strip_json_fence(raw)
     try:
         data = _json.loads(t)
@@ -536,10 +563,25 @@ def run_site_audit(url, catalog_facts):
         raise ValueError(f"Claude вернул не-JSON при аудите: {raw[:400]!r}") from e
     if not ("score" in data and "findings" in data):
         raise ValueError(f"В ответе аудита нет score/findings: {t[:400]!r}")
+
+    # Две проверки добавляем сами, кодом — это факты, не мнение, спрашивать Claude не нужно.
+    data["findings"].append({
+        "check": "llms.txt", "status": "ok" if extracted["llms_txt_status"] == "найден" else "missing",
+        "detail": f"Проверено напрямую кодом: {extracted['llms_txt_status']}",
+    })
+    data["findings"].append({
+        "check": "sitemap.xml", "status": "ok" if extracted["sitemap_status"] == "найден" else "missing",
+        "detail": f"Проверено напрямую кодом: {extracted['sitemap_status']}",
+    })
+    ok_count = sum(1 for f in data["findings"] if f.get("status") == "ok")
+    data["score"] = round(100 * ok_count / len(data["findings"]))
+    _log(f"Готово: {ok_count}/{len(data['findings'])} проверок пройдено, score {data['score']}/100")
+
     content_hash = hashlib.sha256(
         (extracted["visible_text"] + "".join(extracted["jsonld_blocks"])).encode("utf-8")
     ).hexdigest()[:12]
     return _json.dumps(data, ensure_ascii=False), data.get("score"), content_hash
+
 
 
 PRIORITY_LABEL = {"fast_cheap": "быстро / дёшево", "medium": "средне", "slow_expensive": "долго / дорого"}
@@ -1059,15 +1101,17 @@ def _run_audit_and_show(url, label):
         if not ANTHROPIC_API_KEY:
             st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
         else:
-            with st.spinner("Скачиваю страницу и анализирую..."):
+            with st.status("Запускаю аудит agent readiness...", expanded=True) as status_box:
                 try:
                     catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
-                    content_json, score, chash = run_site_audit(url, catalog_facts)
+                    content_json, score, chash = run_site_audit(url, catalog_facts, log=status_box.write)
                     save_audit(url, score, content_json, chash)
                     if label == "Наш сайт":
                         log_site_score(url, audit_score=score)
                     cached_audit = {"score": score, "content": content_json, "content_hash": chash, "generated_at": None}
+                    status_box.update(label=f"Аудит завершён — score {score}/100", state="complete")
                 except Exception as e:
+                    status_box.update(label="Ошибка аудита", state="error")
                     st.error(f"Ошибка аудита: {e}")
                     cached_audit = None
     if cached_audit:
@@ -1099,7 +1143,7 @@ def _run_audit_and_show(url, label):
 
 
 with st.expander("🔍 Аудит сайта — Agent Readiness"):
-    default_audit_own = default_own.rstrip("/") + "/products/base-layer" if "default_own" in dir() else "https://merino.tech/products/base-layer"
+    default_audit_own = default_own if "default_own" in dir() else (NICHE if NICHE.startswith("http") else f"https://{NICHE}")
     ac1, ac2 = st.columns(2)
     with ac1:
         own_audit_url = st.text_input("Наш сайт", value=default_audit_own, key="own_audit_url")
