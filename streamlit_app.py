@@ -323,7 +323,8 @@ def site_score_trend(url, limit=12):
 
 def crawler_score_row(url):
     r = _rows("""SELECT page_status, score, bots_ok, bots_blocked, bots_unknown,
-        html_bytes, text_bytes, content_ratio_pct, jsonld_blocks, summary, checked_at
+        html_bytes, text_bytes, content_ratio_pct, jsonld_blocks,
+        script_bytes, style_bytes, markup_bytes, summary, checked_at
         FROM aeo.crawler_scores WHERE url=%s""", (url,))
     return r[0] if r else None
 
@@ -1017,6 +1018,70 @@ def render_crawler_card(url, label):
         f'{groups_html}</div>', unsafe_allow_html=True)
 
 
+def build_crawler_ai_context(url, score_row, bots):
+    import json as _json
+    payload = {
+        "url": url,
+        "score": score_row["score"],
+        "bots_ok": score_row["bots_ok"], "bots_blocked": score_row["bots_blocked"],
+        "bots_unknown": score_row["bots_unknown"],
+        "html_bytes": score_row["html_bytes"], "text_bytes": score_row["text_bytes"],
+        "content_ratio_pct": float(score_row["content_ratio_pct"]) if score_row["content_ratio_pct"] is not None else None,
+        "script_bytes": score_row.get("script_bytes"), "style_bytes": score_row.get("style_bytes"),
+        "markup_bytes": score_row.get("markup_bytes"),
+        "summary": score_row["summary"],
+        "bots_detail": [
+            {"bot": b["bot"], "category": b["category"], "critical": b["is_critical"],
+             "verdict": b["verdict"], "detail": b["detail"]}
+            for b in bots
+        ],
+    }
+    return _json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def build_crawler_report_prompt(context_text):
+    return f"""Ты — консультант по технической доступности сайта для AI-краулеров (не по контент-разметке — это отдельная проверка).
+
+Ниже JSON-снапшот проверки доступности одной страницы для 12 AI-краулеров (search/agent/training)
+и разбивка веса HTML-страницы (script/style/разметка/текст).
+
+{context_text}
+
+СТРОГИЕ ПРАВИЛА ТОЧНОСТИ:
+1. Используй ТОЛЬКО числа из JSON выше дословно. Не пересчитывай и не выдумывай новые.
+2. Не придумывай прогнозы вида "+X% за Y недель" — у нас нет исторических данных для таких оценок.
+3. Приоритет действия — строго одно из: "fast_cheap", "medium", "slow_expensive".
+4. Каждое действие должно ссылаться на конкретный факт из JSON (конкретный бот, конкретный % веса).
+
+ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON, без markdown-обёртки:
+{{
+  "situation": "2-3 предложения с точными цифрами из JSON выше",
+  "conclusion": "2-3 предложения: что это значит для видимости в AI и к чему ведёт статус-кво",
+  "actions": [
+    {{"title": "короткий заголовок (3-6 слов)",
+      "detail": "конкретика: что сделать и зачем, со ссылкой на факт из JSON",
+      "priority": "fast_cheap"}}
+  ]
+}}
+В "actions" — от 2 до 4 пунктов."""
+
+
+def ai_analyze_crawler(url, score_row, bots):
+    context = build_crawler_ai_context(url, score_row, bots)
+    prompt = build_crawler_report_prompt(context)
+
+    import json as _json
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model="claude-sonnet-4-5", max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    data = _extract_json(raw)
+    return _json.dumps(data, ensure_ascii=False)
+
+
 st.write("")
 # ── Модуль отслеживания нашего сайта: история готовности во времени ──
 _own_domain_for_history = NICHE if NICHE.startswith("http") else f"https://{NICHE}"
@@ -1075,6 +1140,27 @@ with st.expander("🕷️ Доступность для AI-краулеров (�
                 except Exception as e:
                     st.error(f"Ошибка: {e}")
         render_crawler_card(own_url, "Наш сайт")
+
+        _own_score_row = crawler_score_row(own_url)
+        if _own_score_row and _own_score_row.get("score") is not None:
+            ai_col1, ai_col2 = st.columns([3, 2])
+            with ai_col2:
+                crawler_ai_clicked = st.button("🤖 Разбор доступности от Claude", key="crawler_ai_btn",
+                                               use_container_width=True)
+            if crawler_ai_clicked:
+                if not ANTHROPIC_API_KEY:
+                    st.error("ANTHROPIC_API_KEY не найден в Secrets")
+                else:
+                    with st.spinner("Claude анализирует доступность..."):
+                        try:
+                            _own_bots = crawler_bots_rows(own_url)
+                            _crawler_report_json = ai_analyze_crawler(own_url, _own_score_row, _own_bots)
+                            st.session_state["crawler_ai_report"] = _crawler_report_json
+                        except Exception as e:
+                            st.error(f"Ошибка разбора: {e}")
+            if st.session_state.get("crawler_ai_report"):
+                render_ai_report(st.session_state["crawler_ai_report"], "Claude", "Доступность сайта")
+
         st.write("")
         if other_clicked:
             with st.spinner("Проверяю доступность для 12 ботов, это займёт до минуты..."):
