@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS aeo.crawler_scores (
 ALTER TABLE aeo.crawler_access  ADD COLUMN IF NOT EXISTS category text;
 ALTER TABLE aeo.crawler_scores  ADD COLUMN IF NOT EXISTS page_status text;
 ALTER TABLE aeo.crawler_scores  ADD COLUMN IF NOT EXISTS jsonld_blocks int;
+ALTER TABLE aeo.crawler_scores  ADD COLUMN IF NOT EXISTS script_bytes int;
+ALTER TABLE aeo.crawler_scores  ADD COLUMN IF NOT EXISTS style_bytes int;
+ALTER TABLE aeo.crawler_scores  ADD COLUMN IF NOT EXISTS markup_bytes int;
 """
 
 TIMEOUT = 20
@@ -257,15 +260,29 @@ def visible_text(html: str) -> str:
 def analyze_content(html: str) -> dict:
     if not html:
         return {"html_bytes": 0, "text_bytes": 0, "content_ratio_pct": None,
-                "jsonld_blocks": 0, "jsonld_types": []}
+                "jsonld_blocks": 0, "jsonld_types": [],
+                "script_bytes": 0, "style_bytes": 0, "markup_bytes": 0}
     txt = visible_text(html)
     blocks = re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
                         html, flags=re.IGNORECASE | re.DOTALL)
     types = sorted({t for b in blocks
                     for t in re.findall(r'"@type"\s*:\s*"([^"]+)"', b)})
-    return {"html_bytes": len(html), "text_bytes": len(txt),
-            "content_ratio_pct": round(100 * len(txt) / len(html), 2),
-            "jsonld_blocks": len(blocks), "jsonld_types": types}
+
+    # v4: разбивка веса страницы — сколько байт уходит на script/style,
+    # сколько на прочую разметку (теги/атрибуты/комментарии), сколько на видимый текст.
+    script_bytes = sum(len(m) for m in re.findall(r"<script.*?</script>", html,
+                       flags=re.IGNORECASE | re.DOTALL))
+    style_bytes = sum(len(m) for m in re.findall(r"<style.*?</style>", html,
+                      flags=re.IGNORECASE | re.DOTALL))
+    html_bytes = len(html)
+    text_bytes = len(txt)
+    markup_bytes = max(html_bytes - script_bytes - style_bytes - text_bytes, 0)
+
+    return {"html_bytes": html_bytes, "text_bytes": text_bytes,
+            "content_ratio_pct": round(100 * text_bytes / html_bytes, 2),
+            "jsonld_blocks": len(blocks), "jsonld_types": types,
+            "script_bytes": script_bytes, "style_bytes": style_bytes,
+            "markup_bytes": markup_bytes}
 
 
 # ---------------------------------------------------------------------------
@@ -442,8 +459,15 @@ def check_url(url: str, bots: dict = None) -> dict:
 
     cr = content["content_ratio_pct"]
     if cr is not None and cr < THIN_CONTENT_RATIO:
-        summary += (f" Отдельно: полезный текст — {cr}% от {content['html_bytes']:,} байт HTML "
-                    f"({content['text_bytes']:,} символов). Страница тяжёлая для машинного чтения.")
+        hb = content["html_bytes"]
+        sb = content["script_bytes"]
+        stb = content["style_bytes"]
+        mb = content["markup_bytes"]
+        summary += (f" Отдельно: полезный текст — {cr}% от {hb:,} байт HTML "
+                    f"({content['text_bytes']:,} символов). Страница тяжёлая для машинного чтения. "
+                    f"Разбивка веса: script {sb:,} б ({100*sb/hb:.0f}%), "
+                    f"style {stb:,} б ({100*stb/hb:.0f}%), "
+                    f"разметка/теги {mb:,} б ({100*mb/hb:.0f}%).")
 
     return {"url": url, "page_status": "ok", "robots_txt_status": robots_status,
             "cdn": "cloudflare" if baseline.get("cf") else None,
@@ -483,18 +507,22 @@ def save_report(conn, report: dict):
         cur.execute("""
             INSERT INTO aeo.crawler_scores
                 (url, page_status, score, bots_ok, bots_blocked, bots_unknown,
-                 html_bytes, text_bytes, content_ratio_pct, jsonld_blocks, summary, checked_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                 html_bytes, text_bytes, content_ratio_pct, jsonld_blocks,
+                 script_bytes, style_bytes, markup_bytes, summary, checked_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
             ON CONFLICT (url) DO UPDATE SET
                 page_status=EXCLUDED.page_status, score=EXCLUDED.score,
                 bots_ok=EXCLUDED.bots_ok, bots_blocked=EXCLUDED.bots_blocked,
                 bots_unknown=EXCLUDED.bots_unknown, html_bytes=EXCLUDED.html_bytes,
                 text_bytes=EXCLUDED.text_bytes, content_ratio_pct=EXCLUDED.content_ratio_pct,
-                jsonld_blocks=EXCLUDED.jsonld_blocks, summary=EXCLUDED.summary,
-                checked_at=now()""",
+                jsonld_blocks=EXCLUDED.jsonld_blocks,
+                script_bytes=EXCLUDED.script_bytes, style_bytes=EXCLUDED.style_bytes,
+                markup_bytes=EXCLUDED.markup_bytes,
+                summary=EXCLUDED.summary, checked_at=now()""",
             (report["url"], report["page_status"], report["score"], report["bots_ok"],
              report["bots_blocked"], report["bots_unknown"], c["html_bytes"],
-             c["text_bytes"], c["content_ratio_pct"], c["jsonld_blocks"], report["summary"]))
+             c["text_bytes"], c["content_ratio_pct"], c["jsonld_blocks"],
+             c["script_bytes"], c["style_bytes"], c["markup_bytes"], report["summary"]))
     conn.commit()
 
 
@@ -522,6 +550,8 @@ def print_report(rep: dict):
         types = (", ".join(c["jsonld_types"]) or "нет") if c["jsonld_blocks"] else "нет"
         print(f"HTML {c['html_bytes']:,} б · текст {c['text_bytes']:,} "
               f"({c['content_ratio_pct']}%) · JSON-LD: {types}")
+        print(f"Разбивка: script {c['script_bytes']:,} б · style {c['style_bytes']:,} б "
+              f"· прочая разметка {c['markup_bytes']:,} б")
     if rep["cdn"]:
         print(f"CDN: {rep['cdn']}")
     print(f"\n{rep['summary']}\n")
