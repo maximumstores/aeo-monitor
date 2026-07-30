@@ -121,6 +121,41 @@ CREATE TABLE IF NOT EXISTS aeo.site_score_history (
     crawler_score int,
     audit_score int,
     PRIMARY KEY (checked_at, url));
+
+-- Таблицы краулер-чека создаются штатно самим crawler_check.py при запуске
+-- (--save), но дашборд не должен зависеть от того, когда сервер его прогонит
+-- в следующий раз — поэтому гарантируем ту же схему и здесь, идемпотентно.
+CREATE TABLE IF NOT EXISTS aeo.crawler_scores (
+    url            text PRIMARY KEY,
+    page_status    text,
+    score          int,
+    bots_ok        int NOT NULL DEFAULT 0,
+    bots_blocked   int NOT NULL DEFAULT 0,
+    bots_unknown   int NOT NULL DEFAULT 0,
+    html_bytes     int,
+    text_bytes     int,
+    content_ratio_pct numeric,
+    jsonld_blocks  int,
+    summary        text,
+    checked_at     timestamptz NOT NULL DEFAULT now());
+ALTER TABLE aeo.crawler_scores ADD COLUMN IF NOT EXISTS script_bytes int;
+ALTER TABLE aeo.crawler_scores ADD COLUMN IF NOT EXISTS style_bytes int;
+ALTER TABLE aeo.crawler_scores ADD COLUMN IF NOT EXISTS markup_bytes int;
+
+CREATE TABLE IF NOT EXISTS aeo.crawler_access (
+    url            text NOT NULL,
+    bot            text NOT NULL,
+    verdict        text NOT NULL,
+    is_critical    boolean NOT NULL DEFAULT false,
+    category       text,
+    robots_verdict text NOT NULL,
+    http_status    int,
+    blocked_by     text,
+    content_bytes  int,
+    content_delta_pct numeric,
+    detail         text,
+    checked_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (url, bot));
 """
 with psycopg2.connect(DATABASE_URL) as _c, _c.cursor() as _cur:
     _cur.execute(DDL)
