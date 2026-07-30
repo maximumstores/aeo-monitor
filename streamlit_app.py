@@ -1110,6 +1110,10 @@ def _run_audit_and_show(url, label):
 
 
 with st.expander("🔍 Аудит сайта — Agent Readiness"):
+    st.markdown('<div style="display:inline-block;background:#E6ECFE;color:#1F3FBD;'
+                'font-family:\'IBM Plex Mono\',monospace;font-size:11px;font-weight:600;'
+                'padding:4px 12px;border-radius:999px;margin-bottom:10px;letter-spacing:.03em">'
+                '🔍 AGENT READINESS</div>', unsafe_allow_html=True)
     default_audit_own = default_own if "default_own" in dir() else (NICHE if NICHE.startswith("http") else f"https://{NICHE}")
     ac1, ac2 = st.columns(2)
     with ac1:
