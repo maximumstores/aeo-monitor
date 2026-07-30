@@ -598,7 +598,7 @@ def run_site_audit(url, catalog_facts, log=None):
     try:
         data = _json.loads(t)
     except _json.JSONDecodeError as e:
-        raise ValueError(f"Claude вернул не-JSON при аудите: {raw[:400]!r}") from e
+        raise ValueError(f"Claude вернул не-JSON при аудите: {raw[:1200]!r}") from e
     if not ("score" in data and "findings" in data):
         raise ValueError(f"В ответе аудита нет score/findings: {t[:400]!r}")
 
@@ -700,13 +700,27 @@ def _build_report_prompt(context_text):
 
 
 def _strip_json_fence(raw):
-    """Снимает возможную ```json обёртку, ничего не проверяет по схеме."""
+    """Достаёт JSON из ответа модели, даже если перед ним есть пояснительный текст
+    (Claude иногда пишет "Вот результат в JSON:" перед самим блоком) — ищем ```json
+    обёртку в ЛЮБОМ месте текста, а не только в начале строки. Если обёртки нет
+    вовсе — берём подстроку от первой { до последней }, самый частый запасной случай."""
+    import re
     t = (raw or "").strip()
+
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, flags=re.DOTALL)
+    if fence:
+        return fence.group(1).strip()
+
     if t.startswith("```"):
-        t = t.strip("`")
-        if t.startswith("json"):
-            t = t[4:]
-        t = t.strip()
+        t2 = t.strip("`")
+        if t2.startswith("json"):
+            t2 = t2[4:]
+        return t2.strip()
+
+    first, last = t.find("{"), t.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        return t[first:last + 1]
+
     return t
 
 
@@ -717,7 +731,7 @@ def _extract_json(raw):
     try:
         data = _json.loads(t)
     except _json.JSONDecodeError as e:
-        raise ValueError(f"Claude вернул не-JSON: {raw[:300]!r}") from e
+        raise ValueError(f"Claude вернул не-JSON: {raw[:1200]!r}") from e
     if not ("situation" in data and "conclusion" in data and "actions" in data):
         raise ValueError(f"В ответе нет situation/conclusion/actions: {t[:300]!r}")
     return data
@@ -1426,29 +1440,30 @@ else:
 
 st.write("")
 # ── Веб-исследование бренда: живой поиск в сети (не по нашим данным, а по интернету) ──
-with st.expander("🌐 Веб-исследование бренда"):
-    st.caption("Claude ищет в интернете: как независимые обзорники и отзовики видят бренд, "
-               "кто реально побеждает в нише сейчас, и какие есть репутационные пробелы. "
-               "Это медленно меняющиеся вещи — кэшируется на неделю, не на каждый клик.")
-    _wr_cached = get_web_research_cache(week)
-    wr_clicked = st.button(
-        "🌐 Обновить веб-исследование" if _wr_cached else "🌐 Запустить веб-исследование",
-        key="web_research_btn")
-    if wr_clicked:
-        if not ANTHROPIC_API_KEY:
-            st.error("ANTHROPIC_API_KEY не найден в Secrets")
-        else:
-            with st.spinner("Ищу в интернете (может занять минуту — несколько запросов)..."):
-                try:
-                    _wr_content = ai_web_research(NICHE, COMPETITORS)
-                    save_web_research_cache(week, _wr_content)
-                    _wr_cached = {"content": _wr_content}
-                except Exception as e:
-                    st.error(f"Ошибка веб-исследования: {e}")
-    if _wr_cached:
-        render_ai_report(_wr_cached["content"], "Claude + web search", "внешний контекст")
+# Открытая секция, не аккордеон — видна сразу, как основной AI-разбор выше.
+st.markdown('<div class="lab" style="font-size:15px;font-weight:700;color:#1A2233;margin-bottom:2px">🌐 Веб-исследование бренда</div>', unsafe_allow_html=True)
+st.caption("Claude ищет в интернете: как независимые обзорники и отзовики видят бренд, "
+           "кто реально побеждает в нише сейчас, и какие есть репутационные пробелы. "
+           "Это медленно меняющиеся вещи — кэшируется на неделю, не на каждый клик.")
+_wr_cached = get_web_research_cache(week)
+wr_clicked = st.button(
+    "🌐 Обновить веб-исследование" if _wr_cached else "🌐 Запустить веб-исследование",
+    key="web_research_btn")
+if wr_clicked:
+    if not ANTHROPIC_API_KEY:
+        st.error("ANTHROPIC_API_KEY не найден в Secrets")
     else:
-        st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
+        with st.spinner("Ищу в интернете (может занять минуту — несколько запросов)..."):
+            try:
+                _wr_content = ai_web_research(NICHE, COMPETITORS)
+                save_web_research_cache(week, _wr_content)
+                _wr_cached = {"content": _wr_content}
+            except Exception as e:
+                st.error(f"Ошибка веб-исследования: {e}")
+if _wr_cached:
+    render_ai_report(_wr_cached["content"], "Claude + web search", "внешний контекст")
+else:
+    st.caption("Ещё не запускалось на этой неделе — нажми кнопку выше")
 
 st.write("")
 with st.expander("⚗ Эксперименты — гипотеза → действие → измеренный результат"):
