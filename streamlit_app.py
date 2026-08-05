@@ -575,7 +575,53 @@ URL: {url}
 Будь строг: если нужного @type нет в списке выше — статус "missing", не "ok"."""
 
 
-def run_site_audit(url, catalog_facts, log=None):
+def _audit_call_claude(prompt):
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model="claude-sonnet-4-5", max_tokens=2000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+def _audit_call_gemini(prompt):
+    import base64
+    import json as _json
+
+    from google import genai
+    from google.genai import types
+
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        from google.oauth2 import service_account
+
+        info = _json.loads(base64.b64decode(VERTEX_SA_JSON_B64))
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        project = VERTEX_PROJECT or info.get("project_id")
+        client = genai.Client(vertexai=True, project=project, location=VERTEX_LOCATION, credentials=creds)
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
+    )
+    return resp.text or ""
+
+
+AUDIT_BACKENDS = {}
+if ANTHROPIC_API_KEY:
+    AUDIT_BACKENDS["Claude"] = _audit_call_claude
+if GEMINI_API_KEY or VERTEX_SA_JSON_B64:
+    AUDIT_BACKENDS["Gemini"] = _audit_call_gemini
+
+
+def run_site_audit(url, catalog_facts, log=None, model="Claude"):
     """log — необязательная функция(str), вызывается на каждом шаге для показа прогресса в UI."""
     def _log(msg):
         if log:
@@ -591,25 +637,22 @@ def run_site_audit(url, catalog_facts, log=None):
     _log(f"sitemap.xml: {extracted['sitemap_status']}")
 
     prompt = build_audit_prompt(url, extracted, catalog_facts)
-    _log("Отправляю на анализ в Claude (6 смысловых проверок, с доступом к web_search при необходимости)...")
+    _log(f"Отправляю на анализ в {model} (6 смысловых проверок, с доступом к web_search при необходимости)...")
 
-    import anthropic
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    resp = client.messages.create(
-        model="claude-sonnet-4-5", max_tokens=2000,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    backend = AUDIT_BACKENDS.get(model)
+    if not backend:
+        raise ValueError(f"Модель {model} недоступна — проверь ключи в Secrets")
+    raw = backend(prompt)
+
     t = _strip_json_fence(raw)
     try:
         data = _json.loads(t)
     except _json.JSONDecodeError as e:
-        raise ValueError(f"Claude вернул не-JSON при аудите: {raw[:1200]!r}") from e
+        raise ValueError(f"{model} вернул не-JSON при аудите: {raw[:1200]!r}") from e
     if not ("score" in data and "findings" in data):
         raise ValueError(f"В ответе аудита нет score/findings: {t[:400]!r}")
 
-    # Две проверки добавляем сами, кодом — это факты, не мнение, спрашивать Claude не нужно.
+    # Две проверки добавляем сами, кодом — это факты, не мнение, спрашивать модель не нужно.
     data["findings"].append({
         "check": "llms.txt", "status": "ok" if extracted["llms_txt_status"] == "найден" else "missing",
         "detail": f"Проверено напрямую кодом: {extracted['llms_txt_status']}",
@@ -1056,22 +1099,22 @@ else:
 st.write("")
 st.write("")
 # ── Agent Readiness: аудит страницы сайта (наш сайт + опционально чужой) ──
-def _run_audit_and_show(url, label):
+def _run_audit_and_show(url, label, model="Claude"):
     if not url:
         st.caption(f"{label}: введи URL, чтобы запустить аудит")
         return
     cached_audit = get_cached_audit(url)
     clicked = st.button(
-        f"🔍 {'Обновить' if cached_audit else 'Запустить'} аудит — {label}",
+        f"🔍 {'Обновить' if cached_audit else 'Запустить'} аудит — {label} ({model})",
         use_container_width=True, key=f"audit_btn_{label}")
     if clicked:
-        if not ANTHROPIC_API_KEY:
-            st.error("ANTHROPIC_API_KEY не найден в Secrets — аудит недоступен")
+        if not AUDIT_BACKENDS:
+            st.error("Нет доступных моделей — добавь ANTHROPIC_API_KEY или GEMINI_API_KEY/VERTEX_SA_JSON_B64 в Secrets")
         else:
-            with st.status("Запускаю аудит agent readiness...", expanded=True) as status_box:
+            with st.status(f"Запускаю аудит agent readiness ({model})...", expanded=True) as status_box:
                 try:
                     catalog_facts = _cfg.get("catalog_facts", {}) if "_cfg" in dir() else {}
-                    content_json, score, chash = run_site_audit(url, catalog_facts, log=status_box.write)
+                    content_json, score, chash = run_site_audit(url, catalog_facts, log=status_box.write, model=model)
                     save_audit(url, score, content_json, chash)
                     if label == "Наш сайт":
                         log_site_score(url, audit_score=score)
@@ -1115,15 +1158,21 @@ with st.expander(":blue[🔍 **Аудит сайта — Agent Readiness**]"):
                 'padding:4px 12px;border-radius:999px;margin-bottom:10px;letter-spacing:.03em">'
                 '🔍 AGENT READINESS</div>', unsafe_allow_html=True)
     default_audit_own = default_own if "default_own" in dir() else (NICHE if NICHE.startswith("http") else f"https://{NICHE}")
+    if AUDIT_BACKENDS:
+        audit_model = st.radio("Модель для аудита", list(AUDIT_BACKENDS.keys()), horizontal=True,
+                                key="audit_model_choice")
+    else:
+        audit_model = "Claude"
+        st.caption("Нет доступных моделей — добавь ANTHROPIC_API_KEY или GEMINI_API_KEY/VERTEX_SA_JSON_B64 в Secrets")
     ac1, ac2 = st.columns(2)
     with ac1:
         own_audit_url = st.text_input("Наш сайт", value=default_audit_own, key="own_audit_url")
     with ac2:
         other_audit_url = st.text_input("Чужой сайт (конкурент, опционально)", value="", key="other_audit_url")
-    _run_audit_and_show(own_audit_url, "Наш сайт")
+    _run_audit_and_show(own_audit_url, "Наш сайт", audit_model)
     st.write("")
     if other_audit_url:
-        _run_audit_and_show(other_audit_url, "Чужой сайт")
+        _run_audit_and_show(other_audit_url, "Чужой сайт", audit_model)
     else:
         st.caption("Введи URL конкурента, чтобы сравнить agent readiness бок о бок")
 
@@ -1251,6 +1300,21 @@ if mentions_detail:
 else:
     st.info("В этом срезе ни один движок нас не упомянул ни разу.")
 
+def suggest_channel(query_text):
+    """Эвристика по формулировке запроса — куда девать контент под этот пробел.
+    Не AI-вызов: бесплатно, мгновенно, детерминированно."""
+    t = query_text.lower()
+    if " vs " in t or " vs." in t or "vs " in t:
+        return "Сравнение — питчить сторонним обзорникам"
+    if any(k in t for k in ("under $", "budget", "affordable", "cheap", "alternative to")):
+        return "Сайт + реклама (ценовой сегмент)"
+    if any(k in t for k in ("extreme cold", "running", "hunting", "skiing", "hiking", "backpacking")):
+        return "Блог/гайд под use-case"
+    if t.startswith("what is") or t.startswith("what merino") or "recommend" in t or t.startswith("is "):
+        return "Блог/гайд (разговорный запрос)"
+    return "Сайт — товарная/категорийная страница"
+
+
 st.write("")
 qm = our_query_matrix(week, provider)
 if qm:
@@ -1268,11 +1332,14 @@ if qm:
             f'<td class="n" style="color:{"#12946A" if per.get(p) else "#D6452C"}">{"✓" if per.get(p) else "✗"}</td>'
             for p in provs)
         row_style = ' style="background:#FBE9E4"' if total == 0 else ""
+        channel = suggest_channel(qtexts[qid]) if total == 0 else "—"
         body += (f'<tr{row_style}><td class="n">{qid}</td>'
-                 f'<td>{qtexts[qid][:70]}</td>{cells}</tr>')
+                 f'<td>{qtexts[qid][:70]}</td>{cells}'
+                 f'<td style="font-size:11.5px;color:#5B6577;white-space:nowrap">{channel}</td></tr>')
     st.markdown(f'<div class="card"><h2 class="sec">Где нас нет — {choice}</h2>'
-        f'<table class="aeo"><tr><th>ID</th><th>Запрос</th>{head}</tr>{body}</table>'
-        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном из выбранных движков</p></div>', unsafe_allow_html=True)
+        f'<table class="aeo"><tr><th>ID</th><th>Запрос</th>{head}<th>Куда</th></tr>{body}</table>'
+        f'<p style="font-size:12px;color:#98A2B5;margin-top:8px">Красные строки — нас нет ни в одном из выбранных движков. '
+        f'«Куда» — подсказка по каналу для красных строк: сайт, блог, реклама или питч обзорникам.</p></div>', unsafe_allow_html=True)
 
 CATEGORY_LABELS = {"search": "Search — формируют ответ", "agent": "Agent — по поручению пользователя",
                    "training": "Training — корпус для обучения"}
