@@ -8,7 +8,8 @@ anthropic>=0.49
 fastapi>=0.110
 uvicorn>=0.29
 jinja2>=3.1
-streamlit>=1.35
+streamlit>=1.42
+Authlib>=1.3.2
 
 
 

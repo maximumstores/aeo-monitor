@@ -29,6 +29,11 @@ if not DATABASE_URL:
     st.error("DATABASE_URL не найден в Secrets")
     st.stop()
 
+# Вход через Google (только @maximumstores.online) и журнал входов. Пока нет секции [auth] — открыто, как раньше.
+import usage
+EMAIL = usage.require_employee()
+usage.log_login(DATABASE_URL, EMAIL)
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 if not ANTHROPIC_API_KEY:
     try:
@@ -1026,6 +1031,11 @@ def kpi(label, value, d=None):
 
 wks = weeks()
 st.markdown(f'<div class="aeo-logo">AEO<span>Radar</span></div>', unsafe_allow_html=True)
+_VIEW_MAIN, _VIEW_ACTIVITY = "📊 Дашборд", "📈 Активность дашборда"
+if st.radio("Раздел", [_VIEW_MAIN, _VIEW_ACTIVITY], horizontal=True, label_visibility="collapsed",
+            key="aeo_view") == _VIEW_ACTIVITY:
+    usage.render_activity_page(DATABASE_URL)
+    st.stop()
 if not wks:
     st.info("Данных пока нет — запусти прогон: `python -m monitor.run`")
     st.stop()
